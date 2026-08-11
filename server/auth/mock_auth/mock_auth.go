@@ -38,18 +38,18 @@ func (m *MockAuthHandler) EXPECT() *MockAuthHandlerMockRecorder {
 }
 
 // AddRecord mocks base method.
-func (m *MockAuthHandler) AddRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
+func (m *MockAuthHandler) AddRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "AddRecord", rec, secret, remoteAddr)
+	ret := m.ctrl.Call(m, "AddRecord", ctx, rec, secret)
 	ret0, _ := ret[0].(*auth.Rec)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // AddRecord indicates an expected call of AddRecord.
-func (mr *MockAuthHandlerMockRecorder) AddRecord(rec, secret, remoteAddr interface{}) *gomock.Call {
+func (mr *MockAuthHandlerMockRecorder) AddRecord(ctx, rec, secret interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddRecord", reflect.TypeOf((*MockAuthHandler)(nil).AddRecord), rec, secret, remoteAddr)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddRecord", reflect.TypeOf((*MockAuthHandler)(nil).AddRecord), ctx, rec, secret)
 }
 
 // AsTag mocks base method.
@@ -67,9 +67,9 @@ func (mr *MockAuthHandlerMockRecorder) AsTag(token interface{}) *gomock.Call {
 }
 
 // Authenticate mocks base method.
-func (m *MockAuthHandler) Authenticate(secret []byte, remoteAddr string) (*auth.Rec, []byte, error) {
+func (m *MockAuthHandler) Authenticate(ctx auth.AuthContext, secret []byte) (*auth.Rec, []byte, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Authenticate", secret, remoteAddr)
+	ret := m.ctrl.Call(m, "Authenticate", ctx, secret)
 	ret0, _ := ret[0].(*auth.Rec)
 	ret1, _ := ret[1].([]byte)
 	ret2, _ := ret[2].(error)
@@ -77,23 +77,23 @@ func (m *MockAuthHandler) Authenticate(secret []byte, remoteAddr string) (*auth.
 }
 
 // Authenticate indicates an expected call of Authenticate.
-func (mr *MockAuthHandlerMockRecorder) Authenticate(secret, remoteAddr interface{}) *gomock.Call {
+func (mr *MockAuthHandlerMockRecorder) Authenticate(ctx, secret interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Authenticate", reflect.TypeOf((*MockAuthHandler)(nil).Authenticate), secret, remoteAddr)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Authenticate", reflect.TypeOf((*MockAuthHandler)(nil).Authenticate), ctx, secret)
 }
 
 // DelRecords mocks base method.
-func (m *MockAuthHandler) DelRecords(uid types.Uid) error {
+func (m *MockAuthHandler) DelRecords(tenantID types.TenantID, uid types.Uid) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DelRecords", uid)
+	ret := m.ctrl.Call(m, "DelRecords", tenantID, uid)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // DelRecords indicates an expected call of DelRecords.
-func (mr *MockAuthHandlerMockRecorder) DelRecords(uid interface{}) *gomock.Call {
+func (mr *MockAuthHandlerMockRecorder) DelRecords(tenantID, uid interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DelRecords", reflect.TypeOf((*MockAuthHandler)(nil).DelRecords), uid)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DelRecords", reflect.TypeOf((*MockAuthHandler)(nil).DelRecords), tenantID, uid)
 }
 
 // GenSecret mocks base method.
@@ -127,18 +127,18 @@ func (mr *MockAuthHandlerMockRecorder) GetRealName() *gomock.Call {
 }
 
 // GetResetParams mocks base method.
-func (m *MockAuthHandler) GetResetParams(uid types.Uid) (map[string]any, error) {
+func (m *MockAuthHandler) GetResetParams(tenantID types.TenantID, uid types.Uid) (map[string]any, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetResetParams", uid)
+	ret := m.ctrl.Call(m, "GetResetParams", tenantID, uid)
 	ret0, _ := ret[0].(map[string]any)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // GetResetParams indicates an expected call of GetResetParams.
-func (mr *MockAuthHandlerMockRecorder) GetResetParams(uid interface{}) *gomock.Call {
+func (mr *MockAuthHandlerMockRecorder) GetResetParams(tenantID, uid interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetResetParams", reflect.TypeOf((*MockAuthHandler)(nil).GetResetParams), uid)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetResetParams", reflect.TypeOf((*MockAuthHandler)(nil).GetResetParams), tenantID, uid)
 }
 
 // Init mocks base method.
@@ -170,18 +170,18 @@ func (mr *MockAuthHandlerMockRecorder) IsInitialized() *gomock.Call {
 }
 
 // IsUnique mocks base method.
-func (m *MockAuthHandler) IsUnique(secret []byte, remoteAddr string) (bool, error) {
+func (m *MockAuthHandler) IsUnique(ctx auth.AuthContext, secret []byte) (bool, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "IsUnique", secret, remoteAddr)
+	ret := m.ctrl.Call(m, "IsUnique", ctx, secret)
 	ret0, _ := ret[0].(bool)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // IsUnique indicates an expected call of IsUnique.
-func (mr *MockAuthHandlerMockRecorder) IsUnique(secret, remoteAddr interface{}) *gomock.Call {
+func (mr *MockAuthHandlerMockRecorder) IsUnique(ctx, secret interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsUnique", reflect.TypeOf((*MockAuthHandler)(nil).IsUnique), secret, remoteAddr)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsUnique", reflect.TypeOf((*MockAuthHandler)(nil).IsUnique), ctx, secret)
 }
 
 // RestrictedTags mocks base method.
@@ -200,16 +200,16 @@ func (mr *MockAuthHandlerMockRecorder) RestrictedTags() *gomock.Call {
 }
 
 // UpdateRecord mocks base method.
-func (m *MockAuthHandler) UpdateRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
+func (m *MockAuthHandler) UpdateRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UpdateRecord", rec, secret, remoteAddr)
+	ret := m.ctrl.Call(m, "UpdateRecord", ctx, rec, secret)
 	ret0, _ := ret[0].(*auth.Rec)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // UpdateRecord indicates an expected call of UpdateRecord.
-func (mr *MockAuthHandlerMockRecorder) UpdateRecord(rec, secret, remoteAddr interface{}) *gomock.Call {
+func (mr *MockAuthHandlerMockRecorder) UpdateRecord(ctx, rec, secret interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateRecord", reflect.TypeOf((*MockAuthHandler)(nil).UpdateRecord), rec, secret, remoteAddr)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateRecord", reflect.TypeOf((*MockAuthHandler)(nil).UpdateRecord), ctx, rec, secret)
 }

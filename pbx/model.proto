@@ -154,6 +154,7 @@ message ClientHi {
 	string lang = 5;
 	string platform = 6;
 	bool background = 7;
+	string tenant = 8;
 }
 
 // User creation message {acc}

@@ -124,6 +124,8 @@ type MsgClientHi struct {
 	Platform string `json:"platf,omitempty"`
 	// Session is initially in non-iteractive, i.e. issued by a service. Presence notifications are delayed.
 	Background bool `json:"bkg,omitempty"`
+	// Public enterprise code used to resolve and bind the tenant for this session.
+	Tenant string `json:"tenant,omitempty"`
 }
 
 // MsgClientAcc is an {acc} message for creating or updating a user account.
@@ -363,6 +365,8 @@ type ClientComMessage struct {
 	MetaWhat int `json:"-"`
 	// Timestamp when this message was received by the server.
 	Timestamp time.Time `json:"-"`
+	// Tenant context inherited from the originating session.
+	TenantID types.TenantID `json:"-"`
 
 	// Originating session to send an aknowledgement to.
 	sess *Session
@@ -534,7 +538,7 @@ type MsgTopicSub struct {
 	// Id of the latest Delete operation
 	DelId int `json:"clear,omitempty"`
 	// Number of subscribers, group topics only.
-	SubCnt  int `json:"subcnt,omitempty"`
+	SubCnt int `json:"subcnt,omitempty"`
 	// P2P topics in 'me' {get subs} response:
 
 	// Other user's last online timestamp & user agent
@@ -556,7 +560,7 @@ func (src *MsgTopicSub) describe() string {
 	if src.DelId != 0 {
 		s += " clear=" + strconv.Itoa(src.DelId)
 	}
-		if src.SubCnt != 0 {
+	if src.SubCnt != 0 {
 		s += " subcnt=" + strconv.Itoa(src.SubCnt)
 	}
 	if src.Public != nil {
@@ -836,6 +840,8 @@ type ServerComMessage struct {
 	Info *MsgServerInfo `json:"info,omitempty"`
 
 	// Internal fields.
+	// TenantID is assigned by the server and is never serialized to clients.
+	TenantID types.TenantID `json:"-"`
 
 	// MsgServerData has no Id field, copying it here for use in {ctrl} aknowledgements
 	Id string `json:"-"`
@@ -862,6 +868,7 @@ func (src *ServerComMessage) copy() *ServerComMessage {
 		return nil
 	}
 	dst := &ServerComMessage{
+		TenantID:  src.TenantID,
 		Id:        src.Id,
 		RcptTo:    src.RcptTo,
 		AsUser:    src.AsUser,

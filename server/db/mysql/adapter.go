@@ -41,7 +41,7 @@ type adapter struct {
 }
 
 const (
-	adpVersion  = 116
+	adpVersion  = 117
 	adapterName = "mysql"
 
 	defaultDSN      = "root:@tcp(localhost:3306)/tinode?parseTime=true"
@@ -275,6 +275,26 @@ func (a *adapter) SetMaxResults(val int) error {
 	return nil
 }
 
+// TenantGetByCode resolves a tenant by its public enterprise code.
+func (a *adapter) TenantGetByCode(code string) (*t.Tenant, error) {
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+
+	var tenant t.Tenant
+	err := a.db.GetContext(ctx, &tenant,
+		`SELECT id, code, name, tenant_desc, state, created_at, created_by, updated_at, updated_by
+		 FROM im_tenant WHERE code=? LIMIT 1`, code)
+	if err == sql.ErrNoRows {
+		return nil, t.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &tenant, nil
+}
+
 // CreateDb initializes the storage.
 func (a *adapter) CreateDb(reset bool) error {
 	var err error
@@ -317,6 +337,47 @@ func (a *adapter) CreateDb(reset bool) error {
 	}
 
 	if _, err = tx.Exec("USE " + a.dbName); err != nil {
+		return err
+	}
+
+	if _, err = tx.Exec(
+		`CREATE TABLE im_tenant(
+			id          BIGINT NOT NULL AUTO_INCREMENT,
+			code        VARCHAR(64) NOT NULL,
+			name        VARCHAR(128) NOT NULL,
+			tenant_desc VARCHAR(256),
+			state       SMALLINT NOT NULL,
+			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			created_by  BIGINT NOT NULL,
+			updated_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			updated_by  BIGINT NOT NULL,
+			PRIMARY KEY(id),
+			UNIQUE INDEX uk_im_tenant_code(code)
+		)`); err != nil {
+		return err
+	}
+
+	if _, err = tx.Exec(
+		`CREATE TABLE im_tenant_config(
+			id                BIGINT NOT NULL AUTO_INCREMENT,
+			tenant_id         BIGINT NOT NULL,
+			max_users         BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 means unlimited',
+			max_groups        BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 means unlimited',
+			max_group_members INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 means unlimited',
+			created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			created_by        BIGINT NOT NULL,
+			updated_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			updated_by        BIGINT NOT NULL,
+			PRIMARY KEY(id),
+			UNIQUE INDEX uk_im_tenant_config_tenant_id(tenant_id),
+			CONSTRAINT fk_im_tenant_config_tenant FOREIGN KEY(tenant_id) REFERENCES im_tenant(id) ON DELETE CASCADE
+		)`); err != nil {
+		return err
+	}
+
+	if _, err = tx.Exec(
+		`INSERT INTO im_tenant(code,name,tenant_desc,state,created_by,updated_by)
+		 VALUES('default','Default Tenant',NULL,?,0,0)`, t.TenantStateActive); err != nil {
 		return err
 	}
 
@@ -825,6 +886,55 @@ func (a *adapter) UpgradeDb() error {
 		}
 	}
 
+	if a.version == 116 {
+		// Add tenant registry tables. Business tables become tenant-scoped in
+		// the following schema version.
+		if _, err := a.db.Exec(
+			`CREATE TABLE im_tenant(
+				id          BIGINT NOT NULL AUTO_INCREMENT,
+				code        VARCHAR(64) NOT NULL,
+				name        VARCHAR(128) NOT NULL,
+				tenant_desc VARCHAR(256),
+				state       SMALLINT NOT NULL,
+				created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+				created_by  BIGINT NOT NULL,
+				updated_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+				updated_by  BIGINT NOT NULL,
+				PRIMARY KEY(id),
+				UNIQUE INDEX uk_im_tenant_code(code)
+			)`); err != nil {
+			return err
+		}
+
+		if _, err := a.db.Exec(
+			`CREATE TABLE im_tenant_config(
+				id                BIGINT NOT NULL AUTO_INCREMENT,
+				tenant_id         BIGINT NOT NULL,
+				max_users         BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 means unlimited',
+				max_groups        BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 means unlimited',
+				max_group_members INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 means unlimited',
+				created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+				created_by        BIGINT NOT NULL,
+				updated_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+				updated_by        BIGINT NOT NULL,
+				PRIMARY KEY(id),
+				UNIQUE INDEX uk_im_tenant_config_tenant_id(tenant_id),
+				CONSTRAINT fk_im_tenant_config_tenant FOREIGN KEY(tenant_id) REFERENCES im_tenant(id) ON DELETE CASCADE
+			)`); err != nil {
+			return err
+		}
+
+		if _, err := a.db.Exec(
+			`INSERT INTO im_tenant(code,name,tenant_desc,state,created_by,updated_by)
+			 VALUES('default','Default Tenant',NULL,?,0,0)`, t.TenantStateActive); err != nil {
+			return err
+		}
+
+		if err := bumpVersion(a, 117); err != nil {
+			return err
+		}
+	}
+
 	if a.version != adpVersion {
 		return errors.New("Failed to perform database upgrade to version " + strconv.Itoa(adpVersion) +
 			". DB is still at " + strconv.Itoa(a.version))
@@ -866,6 +976,32 @@ func addTags(tx *sqlx.Tx, table, keyName string, keyVal any, tags []string, igno
 	return nil
 }
 
+func addTenantTags(tx *sqlx.Tx, tenantID t.TenantID, table, keyName string, keyVal any,
+	tags []string, ignoreDups bool) error {
+	if len(tags) == 0 {
+		return nil
+	}
+
+	insert, err := tx.Prepare("INSERT INTO " + table + "(tenant_id," + keyName + ",tag) VALUES(?,?,?)")
+	if err != nil {
+		return err
+	}
+	defer insert.Close()
+
+	for _, tag := range tags {
+		if _, err = insert.Exec(tenantID, keyVal, tag); err != nil {
+			if isDupe(err) && ignoreDups {
+				continue
+			}
+			if isDupe(err) {
+				return t.ErrDuplicate
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 func removeTags(tx *sqlx.Tx, table, keyName string, keyVal any, tags []string) error {
 	if len(tags) == 0 {
 		return nil
@@ -885,6 +1021,9 @@ func removeTags(tx *sqlx.Tx, table, keyName string, keyVal any, tags []string) e
 // UserCreate creates a new user. Returns error and true if error is due to duplicate user name,
 // false for any other error
 func (a *adapter) UserCreate(user *t.User) error {
+	if user == nil || user.TenantID.IsZero() {
+		return t.ErrMalformed
+	}
 	ctx, cancel := a.getContextForTx()
 	if cancel != nil {
 		defer cancel()
@@ -901,8 +1040,9 @@ func (a *adapter) UserCreate(user *t.User) error {
 	}()
 
 	decoded_uid := store.DecodeUid(user.Uid())
-	if _, err = tx.Exec("INSERT INTO users(id,createdat,updatedat,state,access,public,trusted,tags) VALUES(?,?,?,?,?,?,?,?)",
+	if _, err = tx.Exec("INSERT INTO users(id,tenant_id,createdat,updatedat,state,access,public,trusted,tags) VALUES(?,?,?,?,?,?,?,?,?)",
 		decoded_uid,
+		user.TenantID,
 		user.CreatedAt,
 		user.UpdatedAt,
 		user.State,
@@ -914,11 +1054,151 @@ func (a *adapter) UserCreate(user *t.User) error {
 	}
 
 	// Save user's tags to a separate table to make user findable.
-	if err = addTags(tx, "usertags", "userid", decoded_uid, user.Tags, false); err != nil {
+	if err = addTenantTags(tx, user.TenantID, "usertags", "userid", decoded_uid, user.Tags, false); err != nil {
 		return err
 	}
 
 	return tx.Commit()
+}
+
+// TenantAuthAddRecord adds an authentication record scoped to a tenant.
+func (a *adapter) TenantAuthAddRecord(tenantID t.TenantID, uid t.Uid, scheme, unique string,
+	authLvl auth.Level, secret []byte, expires time.Time) error {
+	if tenantID.IsZero() {
+		return t.ErrMalformed
+	}
+	var exp *time.Time
+	if !expires.IsZero() {
+		exp = &expires
+	}
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	_, err := a.db.ExecContext(ctx,
+		"INSERT INTO auth(tenant_id,uname,userid,scheme,authlvl,secret,expires) VALUES(?,?,?,?,?,?,?)",
+		tenantID, unique, store.DecodeUid(uid), scheme, authLvl, secret, exp)
+	if isDupe(err) {
+		return t.ErrDuplicate
+	}
+	return err
+}
+
+// TenantAuthDelScheme deletes an authentication scheme only in the selected tenant.
+func (a *adapter) TenantAuthDelScheme(tenantID t.TenantID, uid t.Uid, scheme string) error {
+	if tenantID.IsZero() {
+		return t.ErrMalformed
+	}
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	_, err := a.db.ExecContext(ctx, "DELETE FROM auth WHERE tenant_id=? AND userid=? AND scheme=?",
+		tenantID, store.DecodeUid(uid), scheme)
+	return err
+}
+
+// TenantAuthUpdRecord updates an authentication record only in the selected tenant.
+func (a *adapter) TenantAuthUpdRecord(tenantID t.TenantID, uid t.Uid, scheme, unique string,
+	authLvl auth.Level, secret []byte, expires time.Time) error {
+	if tenantID.IsZero() {
+		return t.ErrMalformed
+	}
+	params := []string{"authlvl=?"}
+	args := []any{authLvl}
+	if unique != "" {
+		params = append(params, "uname=?")
+		args = append(args, unique)
+	}
+	if len(secret) > 0 {
+		params = append(params, "secret=?")
+		args = append(args, secret)
+	}
+	if !expires.IsZero() {
+		params = append(params, "expires=?")
+		args = append(args, expires)
+	}
+	args = append(args, tenantID, store.DecodeUid(uid), scheme)
+
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	resp, err := a.db.ExecContext(ctx, "UPDATE auth SET "+strings.Join(params, ",")+
+		" WHERE tenant_id=? AND userid=? AND scheme=?", args...)
+	if isDupe(err) {
+		return t.ErrDuplicate
+	}
+	if err != nil {
+		return err
+	}
+	if count, _ := resp.RowsAffected(); count <= 0 {
+		return t.ErrNotFound
+	}
+	return nil
+}
+
+// TenantAuthGetRecord retrieves a user's authentication record in one tenant.
+func (a *adapter) TenantAuthGetRecord(tenantID t.TenantID, uid t.Uid, scheme string) (string,
+	auth.Level, []byte, time.Time, error) {
+	var expires time.Time
+	if tenantID.IsZero() {
+		return "", auth.LevelNone, nil, expires, t.ErrMalformed
+	}
+	var record struct {
+		Uname   string
+		Authlvl auth.Level
+		Secret  []byte
+		Expires *time.Time
+	}
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	err := a.db.GetContext(ctx, &record,
+		"SELECT uname,secret,expires,authlvl FROM auth WHERE tenant_id=? AND userid=? AND scheme=?",
+		tenantID, store.DecodeUid(uid), scheme)
+	if err == sql.ErrNoRows {
+		err = t.ErrNotFound
+	}
+	if err != nil {
+		return "", auth.LevelNone, nil, expires, err
+	}
+	if record.Expires != nil {
+		expires = *record.Expires
+	}
+	return record.Uname, record.Authlvl, record.Secret, expires, nil
+}
+
+// TenantAuthGetUniqueRecord retrieves an authentication record by tenant-local login.
+func (a *adapter) TenantAuthGetUniqueRecord(tenantID t.TenantID, unique string) (t.Uid,
+	auth.Level, []byte, time.Time, error) {
+	var expires time.Time
+	if tenantID.IsZero() {
+		return t.ZeroUid, auth.LevelNone, nil, expires, t.ErrMalformed
+	}
+	var record struct {
+		Userid  int64
+		Authlvl auth.Level
+		Secret  []byte
+		Expires *time.Time
+	}
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	err := a.db.GetContext(ctx, &record,
+		"SELECT userid,secret,expires,authlvl FROM auth WHERE tenant_id=? AND uname=?", tenantID, unique)
+	if err == sql.ErrNoRows {
+		return t.ZeroUid, auth.LevelNone, nil, expires, nil
+	}
+	if err != nil {
+		return t.ZeroUid, auth.LevelNone, nil, expires, err
+	}
+	if record.Expires != nil {
+		expires = *record.Expires
+	}
+	return store.EncodeUid(record.Userid), record.Authlvl, record.Secret, expires, nil
 }
 
 // Add user's authentication record
@@ -1437,6 +1717,27 @@ func (a *adapter) UserGetByCred(method, value string) (t.Uid, error) {
 	return t.ZeroUid, err
 }
 
+// TenantUserGetByCred returns a user ID for a validated credential in one tenant.
+func (a *adapter) TenantUserGetByCred(tenantID t.TenantID, method, value string) (t.Uid, error) {
+	if tenantID.IsZero() {
+		return t.ZeroUid, t.ErrMalformed
+	}
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	var decodedUID int64
+	err := a.db.GetContext(ctx, &decodedUID,
+		"SELECT userid FROM credentials WHERE tenant_id=? AND synthetic=?", tenantID, method+":"+value)
+	if err == sql.ErrNoRows {
+		return t.ZeroUid, nil
+	}
+	if err != nil {
+		return t.ZeroUid, err
+	}
+	return store.EncodeUid(decodedUID), nil
+}
+
 // UserUnreadCount returns the total number of unread messages in all topics with
 // the R permission. If read fails, the counts are still returned with the original
 // user IDs but with the unread count undefined and non-nil error.
@@ -1553,33 +1854,37 @@ func (a *adapter) TopicCreate(topic *t.Topic) error {
 
 // If undelete = true - update subscription on duplicate key, otherwise ignore the duplicate.
 func createSubscription(tx *sqlx.Tx, sub *t.Subscription, undelete bool) error {
+	if sub == nil || sub.TenantID.IsZero() {
+		return t.ErrMalformed
+	}
 
 	isOwner := (sub.ModeGiven & sub.ModeWant).IsOwner()
 
 	jpriv := common.ToJSON(sub.Private)
 	decoded_uid := store.DecodeUid(t.ParseUid(sub.User))
 	_, err := tx.Exec(
-		"INSERT INTO subscriptions(createdat,updatedat,deletedat,userid,topic,modeWant,modeGiven,private) "+
-			"VALUES(?,?,NULL,?,?,?,?,?)",
-		sub.CreatedAt, sub.UpdatedAt, decoded_uid, sub.Topic, sub.ModeWant.String(), sub.ModeGiven.String(), jpriv)
+		"INSERT INTO subscriptions(tenant_id,createdat,updatedat,deletedat,userid,topic,modeWant,modeGiven,private) "+
+			"VALUES(?,?,?,NULL,?,?,?,?,?)",
+		sub.TenantID, sub.CreatedAt, sub.UpdatedAt, decoded_uid, sub.Topic, sub.ModeWant.String(), sub.ModeGiven.String(), jpriv)
 
 	if err != nil && isDupe(err) {
 		if undelete {
 			_, err = tx.Exec("UPDATE subscriptions SET createdat=?,updatedat=?,deletedat=NULL,modeWant=?,modeGiven=?,"+
-				"delid=0,recvseqid=0,readseqid=0 WHERE topic=? AND userid=?",
-				sub.CreatedAt, sub.UpdatedAt, sub.ModeWant.String(), sub.ModeGiven.String(), sub.Topic, decoded_uid)
+				"delid=0,recvseqid=0,readseqid=0 WHERE tenant_id=? AND topic=? AND userid=?",
+				sub.CreatedAt, sub.UpdatedAt, sub.ModeWant.String(), sub.ModeGiven.String(), sub.TenantID,
+				sub.Topic, decoded_uid)
 		} else {
 			_, err = tx.Exec("UPDATE subscriptions SET createdat=?,updatedat=?,deletedat=NULL,modeWant=?,modeGiven=?,"+
-				"delid=0,recvseqid=0,readseqid=0,private=? WHERE topic=? AND userid=?",
+				"delid=0,recvseqid=0,readseqid=0,private=? WHERE tenant_id=? AND topic=? AND userid=?",
 				sub.CreatedAt, sub.UpdatedAt, sub.ModeWant.String(), sub.ModeGiven.String(), jpriv,
-				sub.Topic, decoded_uid)
+				sub.TenantID, sub.Topic, decoded_uid)
 		}
 	}
 
 	if err == nil && isOwner {
 		// Update topic owner if the subscription is with owner rights.
 		// Don't increment subscriber count here - it's done in TopicShare in bulk.
-		_, err = tx.Exec("UPDATE topics SET owner=? WHERE name=?", decoded_uid, sub.Topic)
+		_, err = tx.Exec("UPDATE topics SET owner=? WHERE tenant_id=? AND name=?", decoded_uid, sub.TenantID, sub.Topic)
 	}
 	return err
 }
@@ -3168,6 +3473,113 @@ func (a *adapter) CredUpsert(cred *t.Credential) (bool, error) {
 	return true, tx.Commit()
 }
 
+// TenantCredUpsert adds or updates a credential scoped to a tenant.
+func (a *adapter) TenantCredUpsert(tenantID t.TenantID, cred *t.Credential) (bool, error) {
+	if tenantID.IsZero() || cred == nil {
+		return false, t.ErrMalformed
+	}
+	ctx, cancel := a.getContextForTx()
+	if cancel != nil {
+		defer cancel()
+	}
+	tx, err := a.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	now := t.TimeNow()
+	userID := common.DecodeUidString(cred.User)
+	synth := cred.Method + ":" + cred.Value
+	if !cred.Done {
+		var done bool
+		err = tx.Get(&done, "SELECT done FROM credentials WHERE tenant_id=? AND synthetic=?", tenantID, synth)
+		if err == nil {
+			return false, t.ErrDuplicate
+		}
+		if err != sql.ErrNoRows {
+			return false, err
+		}
+		synth = cred.User + ":" + synth
+		_, err = tx.Exec("UPDATE credentials SET deletedat=? WHERE tenant_id=? AND userid=? AND method=? AND done=FALSE",
+			now, tenantID, userID, cred.Method)
+		if err != nil {
+			return false, err
+		}
+		res, err := tx.Exec("UPDATE credentials SET updatedat=?,deletedat=NULL,resp=?,done=FALSE "+
+			"WHERE tenant_id=? AND synthetic=?", cred.UpdatedAt, cred.Resp, tenantID, synth)
+		if err != nil {
+			return false, err
+		}
+		if numRows, _ := res.RowsAffected(); numRows > 0 {
+			return false, tx.Commit()
+		}
+	} else {
+		_, err = tx.Exec("DELETE FROM credentials WHERE tenant_id=? AND synthetic=?",
+			tenantID, cred.User+":"+synth)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	_, err = tx.Exec("INSERT INTO credentials(tenant_id,createdat,updatedat,method,value,synthetic,userid,resp,done) "+
+		"VALUES(?,?,?,?,?,?,?,?,?)", tenantID, cred.CreatedAt, cred.UpdatedAt, cred.Method, cred.Value,
+		synth, userID, cred.Resp, cred.Done)
+	if isDupe(err) {
+		return true, t.ErrDuplicate
+	}
+	if err != nil {
+		return true, err
+	}
+	return true, tx.Commit()
+}
+
+func tenantCredDel(tx *sqlx.Tx, tenantID t.TenantID, uid t.Uid, method, value string) error {
+	constraints := " WHERE tenant_id=? AND userid=?"
+	args := []any{tenantID, store.DecodeUid(uid)}
+	if method != "" {
+		constraints += " AND method=?"
+		args = append(args, method)
+		if value != "" {
+			constraints += " AND value=?"
+			args = append(args, value)
+		}
+	}
+
+	if method == "" {
+		res, err := tx.Exec("DELETE FROM credentials"+constraints, args...)
+		if err != nil {
+			return err
+		}
+		if count, _ := res.RowsAffected(); count == 0 {
+			return t.ErrNotFound
+		}
+		return nil
+	}
+
+	res, err := tx.Exec("DELETE FROM credentials"+constraints+" AND (done=TRUE OR retries=0)", args...)
+	if err != nil {
+		return err
+	}
+	if count, _ := res.RowsAffected(); count > 0 {
+		return nil
+	}
+
+	args = append([]any{t.TimeNow()}, args...)
+	res, err = tx.Exec("UPDATE credentials SET deletedat=?"+constraints, args...)
+	if err != nil {
+		return err
+	}
+	if count, _ := res.RowsAffected(); count == 0 {
+		return t.ErrNotFound
+	}
+	return nil
+}
+
 // credDel deletes given validation method or all methods of the given user.
 // 1. If user is being deleted, hard-delete all records (method == "")
 // 2. If one value is being deleted:
@@ -3248,6 +3660,26 @@ func (a *adapter) CredDel(uid t.Uid, method, value string) error {
 	return tx.Commit()
 }
 
+// TenantCredDel deletes credentials only in the selected tenant.
+func (a *adapter) TenantCredDel(tenantID t.TenantID, uid t.Uid, method, value string) error {
+	if tenantID.IsZero() {
+		return t.ErrMalformed
+	}
+	ctx, cancel := a.getContextForTx()
+	if cancel != nil {
+		defer cancel()
+	}
+	tx, err := a.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err = tenantCredDel(tx, tenantID, uid, method, value); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 // CredConfirm marks given credential method as confirmed.
 func (a *adapter) CredConfirm(uid t.Uid, method string) error {
 	ctx, cancel := a.getContext()
@@ -3271,6 +3703,31 @@ func (a *adapter) CredConfirm(uid t.Uid, method string) error {
 	return nil
 }
 
+// TenantCredConfirm confirms a credential only in the selected tenant.
+func (a *adapter) TenantCredConfirm(tenantID t.TenantID, uid t.Uid, method string) error {
+	if tenantID.IsZero() {
+		return t.ErrMalformed
+	}
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	res, err := a.db.ExecContext(ctx,
+		"UPDATE credentials SET updatedat=?,done=TRUE,synthetic=CONCAT(method,':',value) "+
+			"WHERE tenant_id=? AND userid=? AND method=? AND deletedat IS NULL AND done=FALSE",
+		t.TimeNow(), tenantID, store.DecodeUid(uid), method)
+	if isDupe(err) {
+		return t.ErrDuplicate
+	}
+	if err != nil {
+		return err
+	}
+	if numRows, _ := res.RowsAffected(); numRows < 1 {
+		return t.ErrNotFound
+	}
+	return nil
+}
+
 // CredFail increments failure count of the given validation method.
 func (a *adapter) CredFail(uid t.Uid, method string) error {
 	ctx, cancel := a.getContext()
@@ -3279,6 +3736,21 @@ func (a *adapter) CredFail(uid t.Uid, method string) error {
 	}
 	_, err := a.db.ExecContext(ctx, "UPDATE credentials SET updatedat=?,retries=retries+1 WHERE userid=? AND method=? AND done=FALSE",
 		t.TimeNow(), store.DecodeUid(uid), method)
+	return err
+}
+
+// TenantCredFail increments credential failures only in the selected tenant.
+func (a *adapter) TenantCredFail(tenantID t.TenantID, uid t.Uid, method string) error {
+	if tenantID.IsZero() {
+		return t.ErrMalformed
+	}
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	_, err := a.db.ExecContext(ctx, "UPDATE credentials SET updatedat=?,retries=retries+1 "+
+		"WHERE tenant_id=? AND userid=? AND method=? AND done=FALSE",
+		t.TimeNow(), tenantID, store.DecodeUid(uid), method)
 	return err
 }
 
@@ -3300,6 +3772,29 @@ func (a *adapter) CredGetActive(uid t.Uid, method string) (*t.Credential, error)
 	}
 	cred.User = uid.String()
 
+	return &cred, nil
+}
+
+// TenantCredGetActive returns the active credential in the selected tenant.
+func (a *adapter) TenantCredGetActive(tenantID t.TenantID, uid t.Uid, method string) (*t.Credential, error) {
+	if tenantID.IsZero() {
+		return nil, t.ErrMalformed
+	}
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	var cred t.Credential
+	err := a.db.GetContext(ctx, &cred, "SELECT createdat,updatedat,method,value,resp,done,retries "+
+		"FROM credentials WHERE tenant_id=? AND userid=? AND deletedat IS NULL AND method=? AND done=FALSE",
+		tenantID, store.DecodeUid(uid), method)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	cred.User = uid.String()
 	return &cred, nil
 }
 
@@ -3331,6 +3826,37 @@ func (a *adapter) CredGetAll(uid t.Uid, method string, validatedOnly bool) ([]t.
 	}
 
 	return credentials, err
+}
+
+// TenantCredGetAll returns credentials only from the selected tenant.
+func (a *adapter) TenantCredGetAll(tenantID t.TenantID, uid t.Uid, method string,
+	validatedOnly bool) ([]t.Credential, error) {
+	if tenantID.IsZero() {
+		return nil, t.ErrMalformed
+	}
+	query := "SELECT createdat,updatedat,method,value,resp,done,retries FROM credentials " +
+		"WHERE tenant_id=? AND userid=? AND deletedat IS NULL"
+	args := []any{tenantID, store.DecodeUid(uid)}
+	if method != "" {
+		query += " AND method=?"
+		args = append(args, method)
+	}
+	if validatedOnly {
+		query += " AND done=TRUE"
+	}
+	ctx, cancel := a.getContext()
+	if cancel != nil {
+		defer cancel()
+	}
+	var credentials []t.Credential
+	if err := a.db.SelectContext(ctx, &credentials, query, args...); err != nil {
+		return nil, err
+	}
+	user := uid.String()
+	for i := range credentials {
+		credentials[i].User = user
+	}
+	return credentials, nil
 }
 
 // FileUploads

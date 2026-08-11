@@ -14,7 +14,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tinode/chat/server/logs"
 	"github.com/tinode/chat/server/media"
@@ -71,7 +73,7 @@ func (fh *fshandler) Init(jsconf string) error {
 }
 
 // Headers is used for cache management and serving CORS headers.
-func (fh *fshandler) Headers(method string, url *url.URL, headers http.Header, serve bool) (http.Header, int, error) {
+func (fh *fshandler) Headers(tenantID types.TenantID, method string, url *url.URL, headers http.Header, serve bool) (http.Header, int, error) {
 	if method == http.MethodGet {
 
 		fid := fh.GetIdFromUrl(url.String())
@@ -79,7 +81,7 @@ func (fh *fshandler) Headers(method string, url *url.URL, headers http.Header, s
 			return nil, 0, types.ErrNotFound
 		}
 
-		fdef, err := fh.getFileRecord(fid)
+		fdef, err := fh.getFileRecord(tenantID, fid)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -110,12 +112,13 @@ func (fh *fshandler) Headers(method string, url *url.URL, headers http.Header, s
 
 // Upload processes request for file upload. The file is given as io.Reader.
 func (fh *fshandler) Upload(fdef *types.FileDef, file io.Reader) (string, int64, error) {
-	// FIXME: create two-three levels of nested directories. Serving from a single directory
-	// with tens of thousands of files in it will not perform well.
-
-	// Generate a unique file name and attach it to path. Using base32 instead of base64 to avoid possible
-	// file name collisions on Windows due to case-insensitive file names there.
-	location := filepath.Join(fh.FileUploadDirectory, fdef.Uid().String32())
+	location, err := tenantFileLocation(fh.FileUploadDirectory, fdef.TenantID, fdef.Uid().String32(), fdef.CreatedAt)
+	if err != nil {
+		return "", 0, err
+	}
+	if err = os.MkdirAll(filepath.Dir(location), 0777); err != nil {
+		return "", 0, err
+	}
 
 	outfile, err := os.Create(location)
 	if err != nil {
@@ -123,7 +126,7 @@ func (fh *fshandler) Upload(fdef *types.FileDef, file io.Reader) (string, int64,
 		return "", 0, err
 	}
 
-	if err = store.Files.StartUpload(fdef); err != nil {
+	if err = store.Files.StartUpload(fdef.TenantID, fdef); err != nil {
 		outfile.Close()
 		os.Remove(location)
 		logs.Warn.Println("failed to create file record", fdef.Id, err)
@@ -152,13 +155,13 @@ func (fh *fshandler) Upload(fdef *types.FileDef, file io.Reader) (string, int64,
 
 // Download processes request for file download.
 // The returned ReadSeekCloser must be closed after use.
-func (fh *fshandler) Download(url string) (*types.FileDef, media.ReadSeekCloser, error) {
+func (fh *fshandler) Download(tenantID types.TenantID, url string) (*types.FileDef, media.ReadSeekCloser, error) {
 	fid := fh.GetIdFromUrl(url)
 	if fid.IsZero() {
 		return nil, nil, types.ErrNotFound
 	}
 
-	fd, err := fh.getFileRecord(fid)
+	fd, err := fh.getFileRecord(tenantID, fid)
 	if err != nil {
 		logs.Warn.Println("Download: file not found", fid)
 		return nil, nil, err
@@ -194,8 +197,8 @@ func (fh *fshandler) GetIdFromUrl(url string) types.Uid {
 }
 
 // getFileRecord given file ID reads file record from the database.
-func (fh *fshandler) getFileRecord(fid types.Uid) (*types.FileDef, error) {
-	fd, err := store.Files.Get(fid.String())
+func (fh *fshandler) getFileRecord(tenantID types.TenantID, fid types.Uid) (*types.FileDef, error) {
+	fd, err := store.Files.Get(tenantID, fid.String())
 	if err != nil {
 		return nil, err
 	}
@@ -210,6 +213,17 @@ func etagFromPath(path string) string {
 	hasher.Write([]byte(path))
 	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).
 		EncodeToString(hasher.Sum(make([]byte, 0, hasher.Size()))))
+}
+
+func tenantFileLocation(root string, tenantID types.TenantID, fileID string, createdAt time.Time) (string, error) {
+	if !tenantID.IsValid() || fileID == "" {
+		return "", types.ErrMalformed
+	}
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	return filepath.Join(root, "tenants", strconv.FormatInt(int64(tenantID), 10),
+		createdAt.Format("2006"), createdAt.Format("01"), fileID), nil
 }
 
 func init() {

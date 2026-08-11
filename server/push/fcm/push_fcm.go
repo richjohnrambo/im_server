@@ -156,7 +156,7 @@ func sendFcmV1(rcpt *push.Receipt, config *configType) {
 			case common.ErrorUnregistered:
 				// Token is no longer valid. Delete token from DB and continue sending.
 				logs.Warn.Println("fcm invalid token:", gerr.FcmErrCode, gerr.ErrMessage)
-				if err := store.Devices.Delete(uids[i], messages[i].Token); err != nil {
+				if err := store.Devices.Delete(rcpt.TenantID, uids[i], messages[i].Token); err != nil {
 					logs.Warn.Println("tnpg failed to delete invalid token:", err)
 				}
 			default:
@@ -175,10 +175,10 @@ func processSubscription(req *push.ChannelReq) {
 	var channels []string
 
 	if req.Channel != "" {
-		devices = DevicesForUser(req.Uid)
-		channel = req.Channel
+		devices = DevicesForUser(req.TenantID, req.Uid)
+		channel = TenantChannelName(req.TenantID, req.Channel)
 	} else if req.DeviceID != "" {
-		channels = ChannelsForUser(req.Uid)
+		channels = ChannelsForUser(req.TenantID, req.Uid)
 		device = req.DeviceID
 	}
 
@@ -214,6 +214,7 @@ func processSubscription(req *push.ChannelReq) {
 	if device != "" && len(channels) > 0 {
 		devices := []string{device}
 		for _, channel := range channels {
+			channel = TenantChannelName(req.TenantID, channel)
 			if req.Unsub {
 				resp, err = handler.client.UnsubscribeFromTopic(context.Background(), devices, channel)
 			} else {

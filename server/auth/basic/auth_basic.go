@@ -111,7 +111,10 @@ func (a *authenticator) IsInitialized() bool {
 }
 
 // AddRecord adds a basic authentication record to DB.
-func (a *authenticator) AddRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
+func (a *authenticator) AddRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
+	if err := auth.BindRecord(ctx, rec); err != nil {
+		return nil, err
+	}
 	uname, password, err := parseSecret(secret)
 	if err != nil {
 		return nil, err
@@ -139,7 +142,7 @@ func (a *authenticator) AddRecord(rec *auth.Rec, secret []byte, remoteAddr strin
 		authLevel = auth.LevelAuth
 	}
 
-	err = store.Users.AddAuthRecord(rec.Uid, authLevel, a.name, uname, passhash, expires)
+	err = store.Users.AddAuthRecord(ctx.TenantID, rec.Uid, authLevel, a.name, uname, passhash, expires)
 	if err != nil {
 		return nil, err
 	}
@@ -152,13 +155,16 @@ func (a *authenticator) AddRecord(rec *auth.Rec, secret []byte, remoteAddr strin
 }
 
 // UpdateRecord updates password for basic authentication.
-func (a *authenticator) UpdateRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
+func (a *authenticator) UpdateRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
+	if err := auth.BindRecord(ctx, rec); err != nil {
+		return nil, err
+	}
 	uname, password, err := parseSecret(secret)
 	if err != nil {
 		return nil, err
 	}
 
-	login, authLevel, _, _, err := store.Users.GetAuthRecord(rec.Uid, a.name)
+	login, authLevel, _, _, err := store.Users.GetAuthRecord(ctx.TenantID, rec.Uid, a.name)
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +178,7 @@ func (a *authenticator) UpdateRecord(rec *auth.Rec, secret []byte, remoteAddr st
 		uname = login
 	} else if err = a.checkLoginPolicy(uname); err != nil {
 		return nil, err
-	} else if uid, _, _, _, err := store.Users.GetAuthUniqueRecord(a.name, uname); err != nil {
+	} else if uid, _, _, _, err := store.Users.GetAuthUniqueRecord(ctx.TenantID, a.name, uname); err != nil {
 		return nil, err
 	} else if !uid.IsZero() {
 		// The (new) user name already exists. Report an error.
@@ -191,7 +197,7 @@ func (a *authenticator) UpdateRecord(rec *auth.Rec, secret []byte, remoteAddr st
 	if rec.Lifetime > 0 {
 		expires = types.TimeNow().Add(time.Duration(rec.Lifetime))
 	}
-	err = store.Users.UpdateAuthRecord(rec.Uid, authLevel, a.name, uname, passhash, expires)
+	err = store.Users.UpdateAuthRecord(ctx.TenantID, rec.Uid, authLevel, a.name, uname, passhash, expires)
 	if err != nil {
 		return nil, err
 	}
@@ -213,13 +219,16 @@ func (a *authenticator) UpdateRecord(rec *auth.Rec, secret []byte, remoteAddr st
 }
 
 // Authenticate checks login and password.
-func (a *authenticator) Authenticate(secret []byte, remoteAddr string) (*auth.Rec, []byte, error) {
+func (a *authenticator) Authenticate(ctx auth.AuthContext, secret []byte) (*auth.Rec, []byte, error) {
+	if !ctx.IsValid() {
+		return nil, nil, types.ErrMalformed
+	}
 	uname, password, err := parseSecret(secret)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	uid, authLvl, passhash, expires, err := store.Users.GetAuthUniqueRecord(a.name, uname)
+	uid, authLvl, passhash, expires, err := store.Users.GetAuthUniqueRecord(ctx.TenantID, a.name, uname)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -243,6 +252,7 @@ func (a *authenticator) Authenticate(secret []byte, remoteAddr string) (*auth.Re
 		lifetime = time.Until(expires)
 	}
 	return &auth.Rec{
+		TenantID:  ctx.TenantID,
 		Uid:       uid,
 		AuthLevel: authLvl,
 		Lifetime:  auth.Duration(lifetime),
@@ -264,7 +274,10 @@ func (a *authenticator) AsTag(token string) string {
 }
 
 // IsUnique checks login uniqueness and policy compliance.
-func (a *authenticator) IsUnique(secret []byte, remoteAddr string) (bool, error) {
+func (a *authenticator) IsUnique(ctx auth.AuthContext, secret []byte) (bool, error) {
+	if !ctx.IsValid() {
+		return false, types.ErrMalformed
+	}
 	uname, _, err := parseSecret(secret)
 	if err != nil {
 		return false, err
@@ -274,7 +287,7 @@ func (a *authenticator) IsUnique(secret []byte, remoteAddr string) (bool, error)
 		return false, err
 	}
 
-	uid, _, _, _, err := store.Users.GetAuthUniqueRecord(a.name, uname)
+	uid, _, _, _, err := store.Users.GetAuthUniqueRecord(ctx.TenantID, a.name, uname)
 	if err != nil {
 		return false, err
 	}
@@ -291,8 +304,8 @@ func (authenticator) GenSecret(rec *auth.Rec) ([]byte, time.Time, error) {
 }
 
 // DelRecords deletes saved authentication records of the given user.
-func (a *authenticator) DelRecords(uid types.Uid) error {
-	return store.Users.DelAuthRecords(uid, a.name)
+func (a *authenticator) DelRecords(tenantID types.TenantID, uid types.Uid) error {
+	return store.Users.DelAuthRecords(tenantID, uid, a.name)
 }
 
 // RestrictedTags returns tag namespaces (prefixes) restricted by this adapter.
@@ -305,8 +318,8 @@ func (a *authenticator) RestrictedTags() ([]string, error) {
 }
 
 // GetResetParams returns authenticator parameters passed to password reset handler.
-func (a *authenticator) GetResetParams(uid types.Uid) (map[string]any, error) {
-	login, _, _, _, err := store.Users.GetAuthRecord(uid, a.name)
+func (a *authenticator) GetResetParams(tenantID types.TenantID, uid types.Uid) (map[string]any, error) {
+	login, _, _, _, err := store.Users.GetAuthRecord(tenantID, uid, a.name)
 	if err != nil {
 		return nil, err
 	}

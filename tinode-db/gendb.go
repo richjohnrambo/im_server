@@ -15,7 +15,7 @@ import (
 	"github.com/tinode/chat/server/store/types"
 )
 
-func genDb(data *Data, p2pDel bool) {
+func genDb(data *Data, p2pDel bool, tenantID types.TenantID) {
 	var err error
 	var botAccount string
 
@@ -39,7 +39,8 @@ func genDb(data *Data, p2pDel bool) {
 			log.Fatal(err)
 		}
 		user := types.User{
-			State: state,
+			TenantID: tenantID,
+			State:    state,
 			Access: types.DefaultAccess{
 				Auth: types.ModeCAuth,
 				Anon: types.ModeNone,
@@ -61,13 +62,13 @@ func genDb(data *Data, p2pDel bool) {
 		}
 
 		// store.Users.Create will subscribe user to !me topic but won't create a !me topic
-		if _, err := store.Users.Create(&user, uu.Private); err != nil {
+		if _, err := store.Users.Create(tenantID, &user, uu.Private); err != nil {
 			log.Fatal(err)
 		}
 
 		// Save credentials: email and phone number as if they were confirmed.
 		if uu.Email != "" {
-			if _, err := store.Users.UpsertCred(&types.Credential{
+			if _, err := store.Users.UpsertCred(tenantID, &types.Credential{
 				User:   user.Id,
 				Method: "email",
 				Value:  uu.Email,
@@ -77,7 +78,7 @@ func genDb(data *Data, p2pDel bool) {
 			}
 		}
 		if uu.Tel != "" {
-			if _, err := store.Users.UpsertCred(&types.Credential{
+			if _, err := store.Users.UpsertCred(tenantID, &types.Credential{
 				User:   user.Id,
 				Method: "tel",
 				Value:  uu.Tel,
@@ -102,15 +103,16 @@ func genDb(data *Data, p2pDel bool) {
 			passwd = getPassword(8)
 			botAccount = uu.Username
 		}
-		if _, err := authHandler.AddRecord(&auth.Rec{Uid: user.Uid(), AuthLevel: authLevel},
-			[]byte(uu.Username+":"+passwd), ""); err != nil {
+		if _, err := authHandler.AddRecord(auth.AuthContext{TenantID: tenantID},
+			&auth.Rec{TenantID: tenantID, Uid: user.Uid(), AuthLevel: authLevel},
+			[]byte(uu.Username+":"+passwd)); err != nil {
 			log.Fatal(err)
 		}
 		nameIndex[uu.Username] = user.Id
 
 		// Add address book as fnd.private
 		if len(uu.AddressBook) > 0 {
-			if err := store.Subs.Update(user.Uid().FndName(), user.Uid(),
+			if err := store.Subs.Update(tenantID, user.Uid().FndName(), user.Uid(),
 				map[string]any{"Private": strings.Join(uu.AddressBook, ",")}); err != nil {
 				log.Fatal(err)
 			}
@@ -143,6 +145,7 @@ func genDb(data *Data, p2pDel bool) {
 		}
 		topic := &types.Topic{
 			ObjHeader: types.ObjHeader{Id: name},
+			TenantID:  tenantID,
 			Access: types.DefaultAccess{
 				Auth: accessAuth,
 				Anon: accessAnon,
@@ -164,7 +167,7 @@ func genDb(data *Data, p2pDel bool) {
 		}
 		topic.CreatedAt = getCreatedTime(gt.CreatedAt)
 
-		if err = store.Topics.Create(topic, owner, gt.OwnerPrivate); err != nil {
+		if err = store.Topics.Create(tenantID, topic, owner, gt.OwnerPrivate); err != nil {
 			log.Fatal(err)
 		}
 		fmt.Println("grp;" + gt.Name + ";" + name)
@@ -216,9 +219,10 @@ func genDb(data *Data, p2pDel bool) {
 			}
 		}
 
-		err := store.Topics.CreateP2P(
+		err := store.Topics.CreateP2P(tenantID,
 			&types.Subscription{
 				ObjHeader: types.ObjHeader{CreatedAt: created},
+				TenantID:  tenantID,
 				User:      uid1.String(),
 				Topic:     topic,
 				ModeWant:  s0want,
@@ -226,6 +230,7 @@ func genDb(data *Data, p2pDel bool) {
 				Private:   ss.Users[0].Private},
 			&types.Subscription{
 				ObjHeader: types.ObjHeader{CreatedAt: created},
+				TenantID:  tenantID,
 				User:      uid2.String(),
 				Topic:     topic,
 				ModeWant:  s1want,
@@ -266,8 +271,9 @@ func genDb(data *Data, p2pDel bool) {
 		if ss.AsChan {
 			tname = types.GrpToChn(tname)
 		}
-		if err = store.Subs.Create(&types.Subscription{
+		if err = store.Subs.Create(tenantID, &types.Subscription{
 			ObjHeader: types.ObjHeader{CreatedAt: getCreatedTime(ss.CreatedAt)},
+			TenantID:  tenantID,
 			User:      nameIndex[ss.User],
 			Topic:     tname,
 			ModeWant:  want,
@@ -328,8 +334,9 @@ func genDb(data *Data, p2pDel bool) {
 				if timestamp.After(now) {
 					now = timestamp
 				}
-				if err, _ = store.Messages.Save(&types.Message{
+				if err, _ = store.Messages.Save(tenantID, &types.Message{
 					ObjHeader: types.ObjHeader{CreatedAt: timestamp},
+					TenantID:  tenantID,
 					SeqId:     seqId,
 					Topic:     topic,
 					From:      from.String(),
@@ -350,8 +357,9 @@ func genDb(data *Data, p2pDel bool) {
 
 			for _, gt := range data.Grouptopics {
 				seqIds[nameIndex[gt.Name]] = 1
-				if err, _ = store.Messages.Save(&types.Message{
+				if err, _ = store.Messages.Save(tenantID, &types.Message{
 					ObjHeader: types.ObjHeader{CreatedAt: now},
+					TenantID:  tenantID,
 					SeqId:     1,
 					Topic:     nameIndex[gt.Name],
 					From:      nameIndex[gt.Owner],
@@ -369,8 +377,9 @@ func genDb(data *Data, p2pDel bool) {
 				}
 				usedp2p[nameIndex[sub.pair]] = true
 				seqIds[nameIndex[sub.pair]] = 1
-				if err, _ = store.Messages.Save(&types.Message{
+				if err, _ = store.Messages.Save(tenantID, &types.Message{
 					ObjHeader: types.ObjHeader{CreatedAt: now},
+					TenantID:  tenantID,
 					SeqId:     1,
 					Topic:     nameIndex[sub.pair],
 					From:      nameIndex[sub.Users[0].Name],
@@ -392,8 +401,9 @@ func genDb(data *Data, p2pDel bool) {
 				seqIds[nameIndex[sub.pair]]++
 				seqId := seqIds[nameIndex[sub.pair]]
 				if sub.Users[0].Name == botAccount || sub.Users[1].Name == botAccount {
-					if err, _ = store.Messages.Save(&types.Message{
+					if err, _ = store.Messages.Save(tenantID, &types.Message{
 						ObjHeader: types.ObjHeader{CreatedAt: ts},
+						TenantID:  tenantID,
 						SeqId:     seqId,
 						Topic:     nameIndex[sub.pair],
 						Head:      types.KVMap{"mime": "text/x-drafty"},

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tinode/chat/server/auth"
@@ -20,6 +21,7 @@ import (
 var adp adapter.Adapter
 var availableAdapters = make(map[string]adapter.Adapter)
 var mediaHandler media.Handler
+var activeTenantIDs sync.Map
 
 // Unique ID generator
 var uGen types.UidGenerator
@@ -61,6 +63,19 @@ func openAdapter(workerId int, jsonconf json.RawMessage) error {
 
 	if adp.IsOpen() {
 		return errors.New("store: connection is already opened")
+	}
+	tenantBusiness, ok := adp.(adapter.TenantBusinessAdapter)
+	if !ok {
+		return errors.New("store: " + adp.GetName() + " adapter does not support tenant-scoped business access")
+	}
+	if !tenantBusiness.TenantBusinessReady() {
+		return errors.New("store: " + adp.GetName() + " adapter tenant-scoped business access is not ready")
+	}
+	if _, ok := adp.(adapter.TenantAdapter); !ok {
+		return errors.New("store: " + adp.GetName() + " adapter does not support tenant resolution")
+	}
+	if _, ok := adp.(adapter.TenantAuthAdapter); !ok {
+		return errors.New("store: " + adp.GetName() + " adapter does not support tenant-scoped authentication")
 	}
 
 	// Initialize snowflake.
@@ -110,6 +125,76 @@ type PersistentStorageInterface interface {
 var Store PersistentStorageInterface
 
 type storeObj struct{}
+
+// TenantsPersistenceInterface defines tenant registry lookups used before authentication.
+type TenantsPersistenceInterface interface {
+	GetByCode(code string) (*types.Tenant, error)
+}
+
+type tenantsMapper struct{}
+
+// Tenants is the tenant registry access object.
+var Tenants TenantsPersistenceInterface
+
+// GetByCode resolves a tenant by its public enterprise code.
+func (tenantsMapper) GetByCode(code string) (*types.Tenant, error) {
+	tenantAdp, ok := adp.(adapter.TenantAdapter)
+	if !ok {
+		return nil, types.ErrUnsupported
+	}
+	return tenantAdp.TenantGetByCode(code)
+}
+
+func tenantAuthAdapter(tenantID types.TenantID) (adapter.TenantAuthAdapter, error) {
+	if !tenantID.IsValid() {
+		return nil, types.ErrMalformed
+	}
+	tenantAdp, ok := adp.(adapter.TenantAuthAdapter)
+	if !ok {
+		return nil, types.ErrUnsupported
+	}
+	return tenantAdp, nil
+}
+
+func tenantBusinessAdapter(tenantID types.TenantID) (adapter.TenantBusinessAdapter, error) {
+	if !tenantID.IsValid() {
+		return nil, types.ErrMalformed
+	}
+	tenantAdp, ok := adp.(adapter.TenantBusinessAdapter)
+	if !ok {
+		return nil, types.ErrUnsupported
+	}
+	if !tenantAdp.TenantBusinessReady() {
+		return nil, types.ErrUnsupported
+	}
+	activeTenantIDs.Store(tenantID, struct{}{})
+	return tenantAdp, nil
+}
+
+// KnownTenantIDs returns tenants which have used the business Store since this
+// process started. It is used only for tenant-scoped maintenance work.
+func KnownTenantIDs() []types.TenantID {
+	var result []types.TenantID
+	activeTenantIDs.Range(func(key, _ any) bool {
+		result = append(result, key.(types.TenantID))
+		return true
+	})
+	return result
+}
+
+// TenantStore is a validated tenant scope. Domain mappers still receive the
+// tenant explicitly so it remains visible at every persistence boundary.
+type TenantStore struct {
+	TenantID types.TenantID
+}
+
+// ForTenant validates and returns a tenant-scoped Store handle.
+func ForTenant(tenantID types.TenantID) (*TenantStore, error) {
+	if _, err := tenantBusinessAdapter(tenantID); err != nil {
+		return nil, err
+	}
+	return &TenantStore{TenantID: tenantID}, nil
+}
 
 // Open initializes the persistence system. Adapter holds a connection pool for a database instance.
 //
@@ -251,35 +336,35 @@ func (s storeObj) DbStats() func() any {
 
 // UsersPersistenceInterface is an interface which defines methods for persistent storage of user records.
 type UsersPersistenceInterface interface {
-	Create(user *types.User, private any) (*types.User, error)
-	GetAuthRecord(user types.Uid, scheme string) (string, auth.Level, []byte, time.Time, error)
-	GetAuthUniqueRecord(scheme, unique string) (types.Uid, auth.Level, []byte, time.Time, error)
-	AddAuthRecord(uid types.Uid, authLvl auth.Level, scheme, unique string, secret []byte, expires time.Time) error
-	UpdateAuthRecord(uid types.Uid, authLvl auth.Level, scheme, unique string, secret []byte, expires time.Time) error
-	DelAuthRecords(uid types.Uid, scheme string) error
-	Get(uid types.Uid) (*types.User, error)
-	GetAll(uid ...types.Uid) ([]types.User, error)
-	GetByCred(method, value string) (types.Uid, error)
-	Delete(id types.Uid, hard bool) error
-	UpdateLastSeen(uid types.Uid, userAgent string, when time.Time) error
-	Update(uid types.Uid, update map[string]any) error
-	UpdateTags(uid types.Uid, add, remove, reset []string) ([]string, error)
-	UpdateState(uid types.Uid, state types.ObjState) error
-	GetSubs(id types.Uid) ([]types.Subscription, error)
-	FindSubs(caller types.Uid, prefPrefix string, required [][]string, optional []string, activeOnly bool) ([]types.Subscription, error)
-	FindOne(tag string) (string, error)
-	GetTopics(id types.Uid, opts *types.QueryOpt) ([]types.Subscription, error)
-	GetTopicsAny(id types.Uid, opts *types.QueryOpt) ([]types.Subscription, error)
-	GetOwnTopics(id types.Uid) ([]string, error)
-	GetChannels(id types.Uid) ([]string, error)
-	UpsertCred(cred *types.Credential) (bool, error)
-	ConfirmCred(id types.Uid, method string) error
-	FailCred(id types.Uid, method string) error
-	GetActiveCred(id types.Uid, method string) (*types.Credential, error)
-	GetAllCreds(id types.Uid, method string, validatedOnly bool) ([]types.Credential, error)
-	DelCred(id types.Uid, method, value string) error
-	GetUnreadCount(ids ...types.Uid) (map[types.Uid]int, error)
-	GetUnvalidated(lastUpdatedBefore time.Time, limit int) ([]types.Uid, error)
+	Create(tenantID types.TenantID, user *types.User, private any) (*types.User, error)
+	GetAuthRecord(tenantID types.TenantID, user types.Uid, scheme string) (string, auth.Level, []byte, time.Time, error)
+	GetAuthUniqueRecord(tenantID types.TenantID, scheme, unique string) (types.Uid, auth.Level, []byte, time.Time, error)
+	AddAuthRecord(tenantID types.TenantID, uid types.Uid, authLvl auth.Level, scheme, unique string, secret []byte, expires time.Time) error
+	UpdateAuthRecord(tenantID types.TenantID, uid types.Uid, authLvl auth.Level, scheme, unique string, secret []byte, expires time.Time) error
+	DelAuthRecords(tenantID types.TenantID, uid types.Uid, scheme string) error
+	Get(tenantID types.TenantID, uid types.Uid) (*types.User, error)
+	GetAll(tenantID types.TenantID, uid ...types.Uid) ([]types.User, error)
+	GetByCred(tenantID types.TenantID, method, value string) (types.Uid, error)
+	Delete(tenantID types.TenantID, id types.Uid, hard bool) error
+	UpdateLastSeen(tenantID types.TenantID, uid types.Uid, userAgent string, when time.Time) error
+	Update(tenantID types.TenantID, uid types.Uid, update map[string]any) error
+	UpdateTags(tenantID types.TenantID, uid types.Uid, add, remove, reset []string) ([]string, error)
+	UpdateState(tenantID types.TenantID, uid types.Uid, state types.ObjState) error
+	GetSubs(tenantID types.TenantID, id types.Uid) ([]types.Subscription, error)
+	FindSubs(tenantID types.TenantID, caller types.Uid, prefPrefix string, required [][]string, optional []string, activeOnly bool) ([]types.Subscription, error)
+	FindOne(tenantID types.TenantID, tag string) (string, error)
+	GetTopics(tenantID types.TenantID, id types.Uid, opts *types.QueryOpt) ([]types.Subscription, error)
+	GetTopicsAny(tenantID types.TenantID, id types.Uid, opts *types.QueryOpt) ([]types.Subscription, error)
+	GetOwnTopics(tenantID types.TenantID, id types.Uid) ([]string, error)
+	GetChannels(tenantID types.TenantID, id types.Uid) ([]string, error)
+	UpsertCred(tenantID types.TenantID, cred *types.Credential) (bool, error)
+	ConfirmCred(tenantID types.TenantID, id types.Uid, method string) error
+	FailCred(tenantID types.TenantID, id types.Uid, method string) error
+	GetActiveCred(tenantID types.TenantID, id types.Uid, method string) (*types.Credential, error)
+	GetAllCreds(tenantID types.TenantID, id types.Uid, method string, validatedOnly bool) ([]types.Credential, error)
+	DelCred(tenantID types.TenantID, id types.Uid, method, value string) error
+	GetUnreadCount(tenantID types.TenantID, ids ...types.Uid) (map[types.Uid]int, error)
+	GetUnvalidated(tenantID types.TenantID, lastUpdatedBefore time.Time, limit int) ([]types.Uid, error)
 }
 
 // usersMapper is a concrete type which implements UsersPersistenceInterface.
@@ -289,21 +374,29 @@ type usersMapper struct{}
 var Users UsersPersistenceInterface
 
 // Create inserts User object into a database, updates creation time and assigns UID
-func (usersMapper) Create(user *types.User, private any) (*types.User, error) {
+func (usersMapper) Create(tenantID types.TenantID, user *types.User, private any) (*types.User, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil || user.TenantID != tenantID {
+		return nil, types.ErrMalformed
+	}
 
 	user.SetUid(Store.GetUid())
 	user.InitTimes()
 
-	err := adp.UserCreate(user)
+	err = tenantAdp.TenantUserCreate(tenantID, user)
 	if err != nil {
 		return nil, err
 	}
 
 	// Create user's subscription to 'me' && 'fnd'. These topics are ephemeral, the topic object need not to be
 	// inserted.
-	err = Subs.Create(
+	err = Subs.Create(tenantID,
 		&types.Subscription{
 			ObjHeader: types.ObjHeader{CreatedAt: user.CreatedAt},
+			TenantID:  user.TenantID,
 			User:      user.Id,
 			Topic:     user.Uid().UserId(),
 			ModeWant:  types.ModeCMeFnd,
@@ -312,6 +405,7 @@ func (usersMapper) Create(user *types.User, private any) (*types.User, error) {
 		},
 		&types.Subscription{
 			ObjHeader: types.ObjHeader{CreatedAt: user.CreatedAt},
+			TenantID:  user.TenantID,
 			User:      user.Id,
 			Topic:     user.Uid().FndName(),
 			ModeWant:  types.ModeCMeFnd,
@@ -321,7 +415,7 @@ func (usersMapper) Create(user *types.User, private any) (*types.User, error) {
 	if err != nil {
 		// Best effort to delete incomplete user record. Orphaned user records are not a problem.
 		// They just take up space.
-		adp.UserDelete(user.Uid(), true)
+		tenantAdp.TenantUserDelete(tenantID, user.Uid(), true)
 		return nil, err
 	}
 
@@ -330,8 +424,12 @@ func (usersMapper) Create(user *types.User, private any) (*types.User, error) {
 
 // GetAuthRecord takes a user ID and a authentication scheme name, fetches unique scheme-dependent identifier and
 // authentication secret.
-func (usersMapper) GetAuthRecord(user types.Uid, scheme string) (string, auth.Level, []byte, time.Time, error) {
-	unique, authLvl, secret, expires, err := adp.AuthGetRecord(user, scheme)
+func (usersMapper) GetAuthRecord(tenantID types.TenantID, user types.Uid, scheme string) (string, auth.Level, []byte, time.Time, error) {
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return "", auth.LevelNone, nil, time.Time{}, err
+	}
+	unique, authLvl, secret, expires, err := tenantAdp.TenantAuthGetRecord(tenantID, user, scheme)
 	if err == nil {
 		parts := strings.Split(unique, ":")
 		if len(parts) > 1 {
@@ -346,174 +444,285 @@ func (usersMapper) GetAuthRecord(user types.Uid, scheme string) (string, auth.Le
 
 // GetAuthUniqueRecord takes a unique identifier and a authentication scheme name, fetches user ID and
 // authentication secret.
-func (usersMapper) GetAuthUniqueRecord(scheme, unique string) (types.Uid, auth.Level, []byte, time.Time, error) {
-	return adp.AuthGetUniqueRecord(scheme + ":" + unique)
+func (usersMapper) GetAuthUniqueRecord(tenantID types.TenantID, scheme, unique string) (types.Uid, auth.Level, []byte, time.Time, error) {
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return types.ZeroUid, auth.LevelNone, nil, time.Time{}, err
+	}
+	return tenantAdp.TenantAuthGetUniqueRecord(tenantID, scheme+":"+unique)
 }
 
 // AddAuthRecord creates a new authentication record for the given user.
-func (usersMapper) AddAuthRecord(uid types.Uid, authLvl auth.Level, scheme, unique string, secret []byte,
+func (usersMapper) AddAuthRecord(tenantID types.TenantID, uid types.Uid, authLvl auth.Level, scheme, unique string, secret []byte,
 	expires time.Time) error {
-
-	return adp.AuthAddRecord(uid, scheme, scheme+":"+unique, authLvl, secret, expires)
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantAuthAddRecord(tenantID, uid, scheme, scheme+":"+unique, authLvl, secret, expires)
 }
 
 // UpdateAuthRecord updates authentication record with a new secret and expiration time.
-func (usersMapper) UpdateAuthRecord(uid types.Uid, authLvl auth.Level, scheme, unique string,
+func (usersMapper) UpdateAuthRecord(tenantID types.TenantID, uid types.Uid, authLvl auth.Level, scheme, unique string,
 	secret []byte, expires time.Time) error {
-
-	return adp.AuthUpdRecord(uid, scheme, scheme+":"+unique, authLvl, secret, expires)
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantAuthUpdRecord(tenantID, uid, scheme, scheme+":"+unique, authLvl, secret, expires)
 }
 
 // DelAuthRecords deletes user's auth records of the given scheme.
-func (usersMapper) DelAuthRecords(uid types.Uid, scheme string) error {
-	return adp.AuthDelScheme(uid, scheme)
+func (usersMapper) DelAuthRecords(tenantID types.TenantID, uid types.Uid, scheme string) error {
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantAuthDelScheme(tenantID, uid, scheme)
 }
 
 // Get returns a user object for the given user ID or nil if the user is not found.
-func (usersMapper) Get(uid types.Uid) (*types.User, error) {
-	return adp.UserGet(uid)
+func (usersMapper) Get(tenantID types.TenantID, uid types.Uid) (*types.User, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	user, err := tenantAdp.TenantUserGet(tenantID, uid)
+	if err == nil && user != nil && user.TenantID != tenantID {
+		return nil, types.ErrNotFound
+	}
+	return user, err
 }
 
 // GetAll returns a slice of user objects for the given user IDs.
-func (usersMapper) GetAll(uid ...types.Uid) ([]types.User, error) {
-	return adp.UserGetAll(uid...)
+func (usersMapper) GetAll(tenantID types.TenantID, uid ...types.Uid) ([]types.User, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	users, err := tenantAdp.TenantUserGetAll(tenantID, uid...)
+	if err != nil {
+		return nil, err
+	}
+	for i := range users {
+		if users[i].TenantID != tenantID {
+			return nil, types.ErrNotFound
+		}
+	}
+	return users, nil
 }
 
 // GetByCred returns user ID for the given validated credential.
-func (usersMapper) GetByCred(method, value string) (types.Uid, error) {
-	return adp.UserGetByCred(method, value)
+func (usersMapper) GetByCred(tenantID types.TenantID, method, value string) (types.Uid, error) {
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return types.ZeroUid, err
+	}
+	return tenantAdp.TenantUserGetByCred(tenantID, method, value)
 }
 
 // Delete deletes user records.
-func (usersMapper) Delete(id types.Uid, hard bool) error {
-	return adp.UserDelete(id, hard)
+func (usersMapper) Delete(tenantID types.TenantID, id types.Uid, hard bool) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantUserDelete(tenantID, id, hard)
 }
 
 // UpdateLastSeen updates LastSeen and UserAgent.
-func (usersMapper) UpdateLastSeen(uid types.Uid, userAgent string, when time.Time) error {
-	return adp.UserUpdate(uid, map[string]any{"LastSeen": when, "UserAgent": userAgent})
+func (usersMapper) UpdateLastSeen(tenantID types.TenantID, uid types.Uid, userAgent string, when time.Time) error {
+	return Users.Update(tenantID, uid, map[string]any{"LastSeen": when, "UserAgent": userAgent})
 }
 
 // Update is a general-purpose update of user data.
-func (usersMapper) Update(uid types.Uid, update map[string]any) error {
+func (usersMapper) Update(tenantID types.TenantID, uid types.Uid, update map[string]any) error {
 	if _, ok := update["UpdatedAt"]; !ok {
 		update["UpdatedAt"] = types.TimeNow()
 	}
-	return adp.UserUpdate(uid, update)
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantUserUpdate(tenantID, uid, update)
 }
 
 // UpdateTags either adds, removes, or resets tags to the given slices.
-func (usersMapper) UpdateTags(uid types.Uid, add, remove, reset []string) ([]string, error) {
-	return adp.UserUpdateTags(uid, add, remove, reset)
+func (usersMapper) UpdateTags(tenantID types.TenantID, uid types.Uid, add, remove, reset []string) ([]string, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantUserUpdateTags(tenantID, uid, add, remove, reset)
 }
 
 // UpdateState changes user's state and state of some topics associated with the user.
-func (usersMapper) UpdateState(uid types.Uid, state types.ObjState) error {
+func (usersMapper) UpdateState(tenantID types.TenantID, uid types.Uid, state types.ObjState) error {
 	update := map[string]any{
 		"State":   state,
 		"StateAt": types.TimeNow()}
-	return adp.UserUpdate(uid, update)
+	return Users.Update(tenantID, uid, update)
 }
 
 // GetSubs loads *all* subscriptions for the given user.
 // Does not load Public/Trusted or Private, does not load deleted subscriptions.
-func (usersMapper) GetSubs(id types.Uid) ([]types.Subscription, error) {
-	return adp.SubsForUser(id)
+func (usersMapper) GetSubs(tenantID types.TenantID, id types.Uid) ([]types.Subscription, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantSubsForUser(tenantID, id)
 }
 
 // FindSubs find a list of users and topics for the given tags. Results are formatted as subscriptions.
 // `required` specifies an AND of ORs for required terms:
 // at least one element of every sublist in `required` must be present in the object's tags list.
 // `optional` specifies a list of optional terms.
-func (usersMapper) FindSubs(caller types.Uid, prefPrefix string, required [][]string, optional []string, activeOnly bool) ([]types.Subscription, error) {
+func (usersMapper) FindSubs(tenantID types.TenantID, caller types.Uid, prefPrefix string, required [][]string, optional []string, activeOnly bool) ([]types.Subscription, error) {
 	if len(required) == 0 && len(optional) == 0 {
 		// No tags specified, return empty list.
 		return nil, nil
 	}
-	return adp.Find(caller.UserId(), prefPrefix, required, optional, activeOnly)
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantFind(tenantID, caller.UserId(), prefPrefix, required, optional, activeOnly)
 }
 
 // Find returns topics and/or users which match the given tag, with optional partial matching.
-func (usersMapper) FindOne(tag string) (string, error) {
-	return adp.FindOne(tag)
+func (usersMapper) FindOne(tenantID types.TenantID, tag string) (string, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return "", err
+	}
+	return tenantAdp.TenantFindOne(tenantID, tag)
 }
 
 // GetTopics load a list of user's subscriptions with Public+Trusted fields copied to subscription
-func (usersMapper) GetTopics(id types.Uid, opts *types.QueryOpt) ([]types.Subscription, error) {
-	return adp.TopicsForUser(id, false, opts)
+func (usersMapper) GetTopics(tenantID types.TenantID, id types.Uid, opts *types.QueryOpt) ([]types.Subscription, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantTopicsForUser(tenantID, id, false, opts)
 }
 
 // GetTopicsAny load a list of user's subscriptions with Public+Trusted fields copied to subscription.
 // Deleted topics are returned too.
-func (usersMapper) GetTopicsAny(id types.Uid, opts *types.QueryOpt) ([]types.Subscription, error) {
-	return adp.TopicsForUser(id, true, opts)
+func (usersMapper) GetTopicsAny(tenantID types.TenantID, id types.Uid, opts *types.QueryOpt) ([]types.Subscription, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantTopicsForUser(tenantID, id, true, opts)
 }
 
 // GetOwnTopics returns a slice of group topic names where the user is the owner.
-func (usersMapper) GetOwnTopics(id types.Uid) ([]string, error) {
-	return adp.OwnTopics(id)
+func (usersMapper) GetOwnTopics(tenantID types.TenantID, id types.Uid) ([]string, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantOwnTopics(tenantID, id)
 }
 
 // GetChannels returns a slice of group topic names where the user is a channel reader.
-func (usersMapper) GetChannels(id types.Uid) ([]string, error) {
-	return adp.ChannelsForUser(id)
+func (usersMapper) GetChannels(tenantID types.TenantID, id types.Uid) ([]string, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantChannelsForUser(tenantID, id)
 }
 
 // UpsertCred adds or updates a credential validation request. Return true if the record was inserted, false if updated.
-func (usersMapper) UpsertCred(cred *types.Credential) (bool, error) {
+func (usersMapper) UpsertCred(tenantID types.TenantID, cred *types.Credential) (bool, error) {
 	cred.InitTimes()
-	return adp.CredUpsert(cred)
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return false, err
+	}
+	return tenantAdp.TenantCredUpsert(tenantID, cred)
 }
 
 // ConfirmCred marks credential method as confirmed.
-func (usersMapper) ConfirmCred(id types.Uid, method string) error {
-	return adp.CredConfirm(id, method)
+func (usersMapper) ConfirmCred(tenantID types.TenantID, id types.Uid, method string) error {
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantCredConfirm(tenantID, id, method)
 }
 
 // FailCred increments fail count for the given credential method.
-func (usersMapper) FailCred(id types.Uid, method string) error {
-	return adp.CredFail(id, method)
+func (usersMapper) FailCred(tenantID types.TenantID, id types.Uid, method string) error {
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantCredFail(tenantID, id, method)
 }
 
 // GetActiveCred gets a the currently active credential for the given user and method.
-func (usersMapper) GetActiveCred(id types.Uid, method string) (*types.Credential, error) {
-	return adp.CredGetActive(id, method)
+func (usersMapper) GetActiveCred(tenantID types.TenantID, id types.Uid, method string) (*types.Credential, error) {
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantCredGetActive(tenantID, id, method)
 }
 
 // GetAllCreds returns credentials of the given user, all or validated only.
-func (usersMapper) GetAllCreds(id types.Uid, method string, validatedOnly bool) ([]types.Credential, error) {
-	return adp.CredGetAll(id, method, validatedOnly)
+func (usersMapper) GetAllCreds(tenantID types.TenantID, id types.Uid, method string, validatedOnly bool) ([]types.Credential, error) {
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantCredGetAll(tenantID, id, method, validatedOnly)
 }
 
 // DelCred deletes user's credentials. If method is "", all credentials are deleted.
-func (usersMapper) DelCred(id types.Uid, method, value string) error {
-	return adp.CredDel(id, method, value)
+func (usersMapper) DelCred(tenantID types.TenantID, id types.Uid, method, value string) error {
+	tenantAdp, err := tenantAuthAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantCredDel(tenantID, id, method, value)
 }
 
 // GetUnreadCount returs users' total count of unread messages in all topics with the R permissions.
-func (usersMapper) GetUnreadCount(ids ...types.Uid) (map[types.Uid]int, error) {
-	return adp.UserUnreadCount(ids...)
+func (usersMapper) GetUnreadCount(tenantID types.TenantID, ids ...types.Uid) (map[types.Uid]int, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantUserUnreadCount(tenantID, ids...)
 }
 
 // GetUnvalidated returns a list of stale user ids which have unvalidated credentials,
 // their auth levels and a comma-separated list of these credential names.
-func (usersMapper) GetUnvalidated(lastUpdatedBefore time.Time, limit int) ([]types.Uid, error) {
-	return adp.UserGetUnvalidated(lastUpdatedBefore, limit)
+func (usersMapper) GetUnvalidated(tenantID types.TenantID, lastUpdatedBefore time.Time, limit int) ([]types.Uid, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantUserGetUnvalidated(tenantID, lastUpdatedBefore, limit)
 }
 
 // TopicsPersistenceInterface is an interface which defines methods for persistent storage of topics.
 type TopicsPersistenceInterface interface {
-	Create(topic *types.Topic, owner types.Uid, private any) error
-	CreateP2P(initiator, invited *types.Subscription) error
-	Get(topic string) (*types.Topic, error)
-	GetUsers(topic string, opts *types.QueryOpt) ([]types.Subscription, error)
-	GetUsersAny(topic string, opts *types.QueryOpt) ([]types.Subscription, error)
-	GetSubs(topic string, opts *types.QueryOpt) ([]types.Subscription, error)
-	GetSubsAny(topic string, opts *types.QueryOpt) ([]types.Subscription, error)
-	Update(topic string, update map[string]any) error
-	UpdateSubCnt(topic string) error
-	OwnerChange(topic string, newOwner types.Uid) error
-	Delete(topic string, isChan, hard bool) error
+	Create(tenantID types.TenantID, topic *types.Topic, owner types.Uid, private any) error
+	CreateP2P(tenantID types.TenantID, initiator, invited *types.Subscription) error
+	Get(tenantID types.TenantID, topic string) (*types.Topic, error)
+	GetUsers(tenantID types.TenantID, topic string, opts *types.QueryOpt) ([]types.Subscription, error)
+	GetUsersAny(tenantID types.TenantID, topic string, opts *types.QueryOpt) ([]types.Subscription, error)
+	GetSubs(tenantID types.TenantID, topic string, opts *types.QueryOpt) ([]types.Subscription, error)
+	GetSubsAny(tenantID types.TenantID, topic string, opts *types.QueryOpt) ([]types.Subscription, error)
+	Update(tenantID types.TenantID, topic string, update map[string]any) error
+	UpdateSubCnt(tenantID types.TenantID, topic string) error
+	OwnerChange(tenantID types.TenantID, topic string, newOwner types.Uid) error
+	Delete(tenantID types.TenantID, topic string, isChan, hard bool) error
 }
 
 // topicsMapper is a concrete type implementing TopicsPersistenceInterface.
@@ -523,20 +732,28 @@ type topicsMapper struct{}
 var Topics TopicsPersistenceInterface
 
 // Create creates a topic and owner's subscription to it.
-func (topicsMapper) Create(topic *types.Topic, owner types.Uid, private any) error {
+func (topicsMapper) Create(tenantID types.TenantID, topic *types.Topic, owner types.Uid, private any) error {
+	if topic == nil || topic.TenantID != tenantID {
+		return types.ErrMalformed
+	}
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
 
 	topic.InitTimes()
 	topic.TouchedAt = topic.CreatedAt
 	topic.Owner = owner.String()
 
-	err := adp.TopicCreate(topic)
+	err = tenantAdp.TenantTopicCreate(tenantID, topic)
 	if err != nil {
 		return err
 	}
 
 	if !owner.IsZero() {
-		err = Subs.Create(&types.Subscription{
+		err = Subs.Create(tenantID, &types.Subscription{
 			ObjHeader: types.ObjHeader{CreatedAt: topic.CreatedAt},
+			TenantID:  tenantID,
 			User:      owner.String(),
 			Topic:     topic.Id,
 			ModeGiven: types.ModeCFull,
@@ -548,73 +765,120 @@ func (topicsMapper) Create(topic *types.Topic, owner types.Uid, private any) err
 }
 
 // CreateP2P creates a P2P topic by generating two user's subsciptions to each other.
-func (topicsMapper) CreateP2P(initiator, invited *types.Subscription) error {
+func (topicsMapper) CreateP2P(tenantID types.TenantID, initiator, invited *types.Subscription) error {
+	if initiator == nil || invited == nil || initiator.TenantID != tenantID || invited.TenantID != tenantID {
+		return types.ErrMalformed
+	}
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
 	initiator.InitTimes()
 	initiator.SetTouchedAt(initiator.CreatedAt)
 	invited.InitTimes()
 	invited.SetTouchedAt(invited.CreatedAt)
 
-	return adp.TopicCreateP2P(initiator, invited)
+	return tenantAdp.TenantTopicCreateP2P(tenantID, initiator, invited)
 }
 
 // Get a single topic with a list of relevant users de-normalized into it
-func (topicsMapper) Get(topic string) (*types.Topic, error) {
-	return adp.TopicGet(topic)
+func (topicsMapper) Get(tenantID types.TenantID, topic string) (*types.Topic, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	result, err := tenantAdp.TenantTopicGet(tenantID, topic)
+	if err == nil && result != nil && result.TenantID != tenantID {
+		return nil, types.ErrNotFound
+	}
+	return result, err
 }
 
 // GetUsers loads subscriptions for topic plus loads user.Public+Trusted.
 // Deleted subscriptions are not loaded.
-func (topicsMapper) GetUsers(topic string, opts *types.QueryOpt) ([]types.Subscription, error) {
-	return adp.UsersForTopic(topic, false, opts)
+func (topicsMapper) GetUsers(tenantID types.TenantID, topic string, opts *types.QueryOpt) ([]types.Subscription, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantUsersForTopic(tenantID, topic, false, opts)
 }
 
 // GetUsersAny loads subscriptions for topic plus loads user.Public+Trusted. It's the same as GetUsers,
 // except it loads deleted subscriptions too.
-func (topicsMapper) GetUsersAny(topic string, opts *types.QueryOpt) ([]types.Subscription, error) {
-	return adp.UsersForTopic(topic, true, opts)
+func (topicsMapper) GetUsersAny(tenantID types.TenantID, topic string, opts *types.QueryOpt) ([]types.Subscription, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantUsersForTopic(tenantID, topic, true, opts)
 }
 
 // GetSubs loads a list of subscriptions to the given topic, user.Public+Trusted and deleted
 // subscriptions are not loaded. Suspended subscriptions are loaded.
-func (topicsMapper) GetSubs(topic string, opts *types.QueryOpt) ([]types.Subscription, error) {
-	return adp.SubsForTopic(topic, false, opts)
+func (topicsMapper) GetSubs(tenantID types.TenantID, topic string, opts *types.QueryOpt) ([]types.Subscription, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantSubsForTopic(tenantID, topic, false, opts)
 }
 
 // GetSubsAny loads a list of subscriptions to the given topic including deleted subscription.
 // user.Public/Trusted are not loaded
-func (topicsMapper) GetSubsAny(topic string, opts *types.QueryOpt) ([]types.Subscription, error) {
-	return adp.SubsForTopic(topic, true, opts)
+func (topicsMapper) GetSubsAny(tenantID types.TenantID, topic string, opts *types.QueryOpt) ([]types.Subscription, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantSubsForTopic(tenantID, topic, true, opts)
 }
 
 // UpdateSubCnt refreshes subscriber count value denormalized in topic.
-func (topicsMapper) UpdateSubCnt(topic string) error {
-	return adp.TopicUpdateSubCnt(topic)
+func (topicsMapper) UpdateSubCnt(tenantID types.TenantID, topic string) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantTopicUpdateSubCnt(tenantID, topic)
 }
 
 // Update is a generic topic update.
-func (topicsMapper) Update(topic string, update map[string]any) error {
+func (topicsMapper) Update(tenantID types.TenantID, topic string, update map[string]any) error {
 	if _, ok := update["UpdatedAt"]; !ok {
 		update["UpdatedAt"] = types.TimeNow()
 	}
-	return adp.TopicUpdate(topic, update)
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantTopicUpdate(tenantID, topic, update)
 }
 
 // OwnerChange replaces the old topic owner with the new owner.
-func (topicsMapper) OwnerChange(topic string, newOwner types.Uid) error {
-	return adp.TopicOwnerChange(topic, newOwner)
+func (topicsMapper) OwnerChange(tenantID types.TenantID, topic string, newOwner types.Uid) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantTopicOwnerChange(tenantID, topic, newOwner)
 }
 
 // Delete deletes topic, messages, attachments, and subscriptions.
-func (topicsMapper) Delete(topic string, isChan, hard bool) error {
-	return adp.TopicDelete(topic, isChan, hard)
+func (topicsMapper) Delete(tenantID types.TenantID, topic string, isChan, hard bool) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantTopicDelete(tenantID, topic, isChan, hard)
 }
 
 // SubsPersistenceInterface is an interface which defines methods for persistent storage of subscriptions.
 type SubsPersistenceInterface interface {
-	Create(subs ...*types.Subscription) error
-	Get(topic string, user types.Uid, keepDeleted bool) (*types.Subscription, error)
-	Update(topic string, user types.Uid, update map[string]any) error
-	Delete(topic string, user types.Uid) error
+	Create(tenantID types.TenantID, subs ...*types.Subscription) error
+	Get(tenantID types.TenantID, topic string, user types.Uid, keepDeleted bool) (*types.Subscription, error)
+	Update(tenantID types.TenantID, topic string, user types.Uid, update map[string]any) error
+	Delete(tenantID types.TenantID, topic string, user types.Uid) error
 }
 
 // subsMapper is a concrete type implementing SubsPersistenceInterface.
@@ -624,7 +888,11 @@ type subsMapper struct{}
 var Subs SubsPersistenceInterface
 
 // Create creates multiple subscriptions.
-func (subsMapper) Create(subs ...*types.Subscription) error {
+func (subsMapper) Create(tenantID types.TenantID, subs ...*types.Subscription) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
 	if len(subs) == 0 {
 		// Nothing to do.
 		return nil
@@ -638,38 +906,57 @@ func (subsMapper) Create(subs ...*types.Subscription) error {
 	}
 
 	for _, sub := range subs {
+		if sub == nil || sub.TenantID != tenantID {
+			return types.ErrMalformed
+		}
 		sub.InitTimes()
 		if topic != "" && sub.Topic != topic {
 			return fmt.Errorf("all subscriptions must be for the same topic, got %s vs %s", sub.Topic, topic)
 		}
 	}
 
-	return adp.TopicShare(topic, subs)
+	return tenantAdp.TenantTopicShare(tenantID, topic, subs)
 }
 
 // Get subscription given topic and user ID.
-func (subsMapper) Get(topic string, user types.Uid, keepDeleted bool) (*types.Subscription, error) {
-	return adp.SubscriptionGet(topic, user, keepDeleted)
+func (subsMapper) Get(tenantID types.TenantID, topic string, user types.Uid, keepDeleted bool) (*types.Subscription, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	result, err := tenantAdp.TenantSubscriptionGet(tenantID, topic, user, keepDeleted)
+	if err == nil && result != nil && result.TenantID != tenantID {
+		return nil, types.ErrNotFound
+	}
+	return result, err
 }
 
 // Update values of topic's subscriptions.
-func (subsMapper) Update(topic string, user types.Uid, update map[string]any) error {
+func (subsMapper) Update(tenantID types.TenantID, topic string, user types.Uid, update map[string]any) error {
 	update["UpdatedAt"] = types.TimeNow()
-	return adp.SubsUpdate(topic, user, update)
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantSubsUpdate(tenantID, topic, user, update)
 }
 
 // Delete deletes a subscription.
 // To delete channel subscription the channel name must be explicitly specified.
-func (subsMapper) Delete(topic string, user types.Uid) error {
-	return adp.SubsDelete(topic, user)
+func (subsMapper) Delete(tenantID types.TenantID, topic string, user types.Uid) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantSubsDelete(tenantID, topic, user)
 }
 
 // MessagesPersistenceInterface is an interface which defines methods for persistent storage of messages.
 type MessagesPersistenceInterface interface {
-	Save(msg *types.Message, attachmentURLs []string, readBySender bool) (error, bool)
-	DeleteList(topic string, delID int, forUser types.Uid, msgDelAge time.Duration, ranges []types.Range) error
-	GetAll(topic string, forUser types.Uid, opt *types.QueryOpt) ([]types.Message, error)
-	GetDeleted(topic string, forUser types.Uid, opt *types.QueryOpt) ([]types.Range, int, error)
+	Save(tenantID types.TenantID, msg *types.Message, attachmentURLs []string, readBySender bool) (error, bool)
+	DeleteList(tenantID types.TenantID, topic string, delID int, forUser types.Uid, msgDelAge time.Duration, ranges []types.Range) error
+	GetAll(tenantID types.TenantID, topic string, forUser types.Uid, opt *types.QueryOpt) ([]types.Message, error)
+	GetDeleted(tenantID types.TenantID, topic string, forUser types.Uid, opt *types.QueryOpt) ([]types.Range, int, error)
 }
 
 // messagesMapper is a concrete type implementing MessagesPersistenceInterface.
@@ -679,16 +966,23 @@ type messagesMapper struct{}
 var Messages MessagesPersistenceInterface
 
 // Save message
-func (messagesMapper) Save(msg *types.Message, attachmentURLs []string, readBySender bool) (error, bool) {
+func (messagesMapper) Save(tenantID types.TenantID, msg *types.Message, attachmentURLs []string, readBySender bool) (error, bool) {
+	if msg == nil || msg.TenantID != tenantID {
+		return types.ErrMalformed, false
+	}
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err, false
+	}
 	msg.InitTimes()
 	msg.SetUid(Store.GetUid())
 	// Increment topic's or user's SeqId
-	err := adp.TopicUpdateOnMessage(msg.Topic, msg)
+	err = tenantAdp.TenantTopicUpdateOnMessage(tenantID, msg.Topic, msg)
 	if err != nil {
 		return err, false
 	}
 
-	err = adp.MessageSave(msg)
+	err = tenantAdp.TenantMessageSave(tenantID, msg)
 	if err != nil {
 		return err, false
 	}
@@ -700,7 +994,7 @@ func (messagesMapper) Save(msg *types.Message, attachmentURLs []string, readBySe
 		fromUid := types.ParseUid(msg.From)
 		if !fromUid.IsZero() {
 			// Ignore the error here. It's not a big deal if it fails.
-			if subErr := adp.SubsUpdate(msg.Topic, fromUid,
+			if subErr := tenantAdp.TenantSubsUpdate(tenantID, msg.Topic, fromUid,
 				map[string]any{
 					"RecvSeqId": msg.SeqId,
 					"ReadSeqId": msg.SeqId}); subErr != nil {
@@ -720,7 +1014,7 @@ func (messagesMapper) Save(msg *types.Message, attachmentURLs []string, readBySe
 			}
 		}
 		if len(attachments) > 0 {
-			return adp.FileLinkAttachments("", types.ZeroUid, msg.Uid(), attachments), markedReadBySender
+			return tenantAdp.TenantFileLinkAttachments(tenantID, "", types.ZeroUid, msg.Uid(), attachments), markedReadBySender
 		}
 	}
 
@@ -728,10 +1022,15 @@ func (messagesMapper) Save(msg *types.Message, attachmentURLs []string, readBySe
 }
 
 // DeleteList deletes multiple messages defined by a list of ranges.
-func (messagesMapper) DeleteList(topic string, delID int, forUser types.Uid, msgDelAge time.Duration, ranges []types.Range) error {
+func (messagesMapper) DeleteList(tenantID types.TenantID, topic string, delID int, forUser types.Uid, msgDelAge time.Duration, ranges []types.Range) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
 	var toDel *types.DelMessage
 	if delID > 0 {
 		toDel = &types.DelMessage{
+			TenantID:    tenantID,
 			Topic:       topic,
 			DelId:       delID,
 			DeletedFor:  forUser.String(),
@@ -743,7 +1042,7 @@ func (messagesMapper) DeleteList(topic string, delID int, forUser types.Uid, msg
 		}
 	}
 
-	err := adp.MessageDeleteList(topic, toDel)
+	err = tenantAdp.TenantMessageDeleteList(tenantID, topic, toDel)
 	if err != nil {
 		return err
 	}
@@ -751,14 +1050,14 @@ func (messagesMapper) DeleteList(topic string, delID int, forUser types.Uid, msg
 	// TODO: move to adapter.
 	if delID > 0 {
 		// Record ID of the delete transaction
-		err = adp.TopicUpdate(topic, map[string]any{"DelId": delID})
+		err = tenantAdp.TenantTopicUpdate(tenantID, topic, map[string]any{"DelId": delID})
 		if err != nil {
 			return err
 		}
 
 		// Soft-deleting will update one subscription, hard-deleting will ipdate all.
 		// Soft- or hard- is defined by the forUser being defined.
-		err = adp.SubsUpdate(topic, forUser, map[string]any{"DelId": delID})
+		err = tenantAdp.TenantSubsUpdate(tenantID, topic, forUser, map[string]any{"DelId": delID})
 		if err != nil {
 			return err
 		}
@@ -768,13 +1067,21 @@ func (messagesMapper) DeleteList(topic string, delID int, forUser types.Uid, msg
 }
 
 // GetAll returns multiple messages.
-func (messagesMapper) GetAll(topic string, forUser types.Uid, opt *types.QueryOpt) ([]types.Message, error) {
-	return adp.MessageGetAll(topic, forUser, opt)
+func (messagesMapper) GetAll(tenantID types.TenantID, topic string, forUser types.Uid, opt *types.QueryOpt) ([]types.Message, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantMessageGetAll(tenantID, topic, forUser, opt)
 }
 
 // GetDeleted returns the ranges of deleted messages and the largest DelId reported in the list.
-func (messagesMapper) GetDeleted(topic string, forUser types.Uid, opt *types.QueryOpt) ([]types.Range, int, error) {
-	dmsgs, err := adp.MessageGetDeleted(topic, forUser, opt)
+func (messagesMapper) GetDeleted(tenantID types.TenantID, topic string, forUser types.Uid, opt *types.QueryOpt) ([]types.Range, int, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, 0, err
+	}
+	dmsgs, err := tenantAdp.TenantMessageGetDeleted(tenantID, topic, forUser, opt)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -935,9 +1242,9 @@ func (storeObj) GetValidator(name string) validate.Validator {
 // DevicePersistenceInterface is an interface which defines methods used for handling device IDs.
 // Mostly used to generate push notifications.
 type DevicePersistenceInterface interface {
-	Update(uid types.Uid, oldDeviceID string, dev *types.DeviceDef) error
-	GetAll(uid ...types.Uid) (map[types.Uid][]types.DeviceDef, int, error)
-	Delete(uid types.Uid, deviceID string) error
+	Update(tenantID types.TenantID, uid types.Uid, oldDeviceID string, dev *types.DeviceDef) error
+	GetAll(tenantID types.TenantID, uid ...types.Uid) (map[types.Uid][]types.DeviceDef, int, error)
+	Delete(tenantID types.TenantID, uid types.Uid, deviceID string) error
 }
 
 // deviceMapper is a concrete type implementing DevicePersistenceInterface.
@@ -947,30 +1254,48 @@ type deviceMapper struct{}
 var Devices DevicePersistenceInterface
 
 // Update updates a device record.
-func (deviceMapper) Update(uid types.Uid, oldDeviceID string, dev *types.DeviceDef) error {
+func (deviceMapper) Update(tenantID types.TenantID, uid types.Uid, oldDeviceID string, dev *types.DeviceDef) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
 	// If the old device Id is specified and it's different from the new ID, delete the old id
 	if oldDeviceID != "" && (dev == nil || dev.DeviceId != oldDeviceID) {
-		if err := adp.DeviceDelete(uid, oldDeviceID); err != nil {
+		if err := tenantAdp.TenantDeviceDelete(tenantID, uid, oldDeviceID); err != nil {
 			return err
 		}
 	}
 
 	// Insert or update the new DeviceId if one is given.
 	if dev != nil && dev.DeviceId != "" {
-		return adp.DeviceUpsert(uid, dev)
+		if dev.TenantID.IsZero() {
+			dev.TenantID = tenantID
+		}
+		if dev.TenantID != tenantID {
+			return types.ErrMalformed
+		}
+		return tenantAdp.TenantDeviceUpsert(tenantID, uid, dev)
 	}
 	return nil
 }
 
 // GetAll returns all known device IDs for a given list of user IDs.
 // The second return parameter is the count of found device IDs.
-func (deviceMapper) GetAll(uid ...types.Uid) (map[types.Uid][]types.DeviceDef, int, error) {
-	return adp.DeviceGetAll(uid...)
+func (deviceMapper) GetAll(tenantID types.TenantID, uid ...types.Uid) (map[types.Uid][]types.DeviceDef, int, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, 0, err
+	}
+	return tenantAdp.TenantDeviceGetAll(tenantID, uid...)
 }
 
 // Delete deletes device record for a given user.
-func (deviceMapper) Delete(uid types.Uid, deviceID string) error {
-	return adp.DeviceDelete(uid, deviceID)
+func (deviceMapper) Delete(tenantID types.TenantID, uid types.Uid, deviceID string) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantDeviceDelete(tenantID, uid, deviceID)
 }
 
 // Registered media/file handlers.
@@ -1008,16 +1333,16 @@ func (storeObj) UseMediaHandler(name, config string) error {
 // FilePersistenceInterface is an interface wchich defines methods used for file handling (records or uploaded files).
 type FilePersistenceInterface interface {
 	// StartUpload records that the given user initiated a file upload
-	StartUpload(fd *types.FileDef) error
+	StartUpload(tenantID types.TenantID, fd *types.FileDef) error
 	// FinishUpload marks started upload as successfully finished.
-	FinishUpload(fd *types.FileDef, success bool, size int64) (*types.FileDef, error)
+	FinishUpload(tenantID types.TenantID, fd *types.FileDef, success bool, size int64) (*types.FileDef, error)
 	// Get fetches a file record for a unique file id.
-	Get(fid string) (*types.FileDef, error)
+	Get(tenantID types.TenantID, fid string) (*types.FileDef, error)
 	// DeleteUnused removes unused attachments.
-	DeleteUnused(olderThan time.Time, limit int) error
+	DeleteUnused(tenantID types.TenantID, olderThan time.Time, limit int) error
 	// LinkAttachments connects earlier uploaded attachments to a message or topic to prevent it
 	// from being garbage collected.
-	LinkAttachments(topic string, msgId types.Uid, attachments []string) error
+	LinkAttachments(tenantID types.TenantID, topic string, msgId types.Uid, attachments []string) error
 }
 
 // fileMapper is concrete type which implements FilePersistenceInterface.
@@ -1027,24 +1352,50 @@ type fileMapper struct{}
 var Files FilePersistenceInterface
 
 // StartUpload records that the given user initiated a file upload
-func (fileMapper) StartUpload(fd *types.FileDef) error {
+func (fileMapper) StartUpload(tenantID types.TenantID, fd *types.FileDef) error {
+	if fd == nil || fd.TenantID != tenantID {
+		return types.ErrMalformed
+	}
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
 	fd.Status = types.UploadStarted
-	return adp.FileStartUpload(fd)
+	return tenantAdp.TenantFileStartUpload(tenantID, fd)
 }
 
 // FinishUpload marks started upload as successfully finished or failed.
-func (fileMapper) FinishUpload(fd *types.FileDef, success bool, size int64) (*types.FileDef, error) {
-	return adp.FileFinishUpload(fd, success, size)
+func (fileMapper) FinishUpload(tenantID types.TenantID, fd *types.FileDef, success bool, size int64) (*types.FileDef, error) {
+	if fd == nil || fd.TenantID != tenantID {
+		return nil, types.ErrMalformed
+	}
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantAdp.TenantFileFinishUpload(tenantID, fd, success, size)
 }
 
 // Get fetches a file record for a unique file id.
-func (fileMapper) Get(fid string) (*types.FileDef, error) {
-	return adp.FileGet(fid)
+func (fileMapper) Get(tenantID types.TenantID, fid string) (*types.FileDef, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := tenantAdp.TenantFileGet(tenantID, fid)
+	if err == nil && fd != nil && fd.TenantID != tenantID {
+		return nil, types.ErrNotFound
+	}
+	return fd, err
 }
 
 // DeleteUnused removes unused attachments and avatars.
-func (fileMapper) DeleteUnused(olderThan time.Time, limit int) error {
-	toDel, err := adp.FileDeleteUnused(olderThan, limit)
+func (fileMapper) DeleteUnused(tenantID types.TenantID, olderThan time.Time, limit int) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	toDel, err := tenantAdp.TenantFileDeleteUnused(tenantID, olderThan, limit)
 	if err != nil {
 		return err
 	}
@@ -1057,7 +1408,11 @@ func (fileMapper) DeleteUnused(olderThan time.Time, limit int) error {
 
 // LinkAttachments connects earlier uploaded attachments to a message or topic to prevent it
 // from being garbage collected.
-func (fileMapper) LinkAttachments(topic string, msgId types.Uid, attachments []string) error {
+func (fileMapper) LinkAttachments(tenantID types.TenantID, topic string, msgId types.Uid, attachments []string) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
 	// Convert attachment URLs to file IDs.
 	var fids []string
 	for _, url := range attachments {
@@ -1072,7 +1427,7 @@ func (fileMapper) LinkAttachments(topic string, msgId types.Uid, attachments []s
 			userId = types.ParseUserId(topic)
 			topic = ""
 		}
-		return adp.FileLinkAttachments(topic, userId, msgId, fids)
+		return tenantAdp.TenantFileLinkAttachments(tenantID, topic, userId, msgId, fids)
 	}
 	return nil
 }
@@ -1080,13 +1435,13 @@ func (fileMapper) LinkAttachments(topic string, msgId types.Uid, attachments []s
 // PersistentCacheInterface is an interface which defines methods used for accessing persistent key-value cache.
 type PersistentCacheInterface interface {
 	// Get reads a persistent cache entry.
-	Get(key string) (string, error)
+	Get(tenantID types.TenantID, key string) (string, error)
 	// Upsert creates or updates a persistent cache entry.
-	Upsert(key string, value string, failOnDuplicate bool) error
+	Upsert(tenantID types.TenantID, key string, value string, failOnDuplicate bool) error
 	// Delete deletes a single persistent cache entry.
-	Delete(key string) error
+	Delete(tenantID types.TenantID, key string) error
 	// Expire expires older entries with the specified key prefix.
-	Expire(keyPrefix string, olderThan time.Time) error
+	Expire(tenantID types.TenantID, keyPrefix string, olderThan time.Time) error
 }
 
 // pcacheMapper is concrete type which implements PersistentCacheInterface.
@@ -1095,23 +1450,39 @@ type pcacheMapper struct{}
 var PCache PersistentCacheInterface
 
 // Get reads a persistent cache entry.
-func (pcacheMapper) Get(key string) (string, error) {
-	return adp.PCacheGet(key)
+func (pcacheMapper) Get(tenantID types.TenantID, key string) (string, error) {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return "", err
+	}
+	return tenantAdp.TenantPCacheGet(tenantID, key)
 }
 
 // Upsert creates or updates a persistent cache entry.
-func (pcacheMapper) Upsert(key string, value string, failOnDuplicate bool) error {
-	return adp.PCacheUpsert(key, value, failOnDuplicate)
+func (pcacheMapper) Upsert(tenantID types.TenantID, key string, value string, failOnDuplicate bool) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantPCacheUpsert(tenantID, key, value, failOnDuplicate)
 }
 
 // Delete deletes a single persistent cache entry.
-func (pcacheMapper) Delete(key string) error {
-	return adp.PCacheDelete(key)
+func (pcacheMapper) Delete(tenantID types.TenantID, key string) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantPCacheDelete(tenantID, key)
 }
 
 // Expire expires older entries with the specified key prefix.
-func (pcacheMapper) Expire(keyPrefix string, olderThan time.Time) error {
-	return adp.PCacheExpire(keyPrefix, olderThan)
+func (pcacheMapper) Expire(tenantID types.TenantID, keyPrefix string, olderThan time.Time) error {
+	tenantAdp, err := tenantBusinessAdapter(tenantID)
+	if err != nil {
+		return err
+	}
+	return tenantAdp.TenantPCacheExpire(tenantID, keyPrefix, olderThan)
 }
 
 func SetTestUidGenerator(g types.UidGenerator) {
@@ -1120,6 +1491,7 @@ func SetTestUidGenerator(g types.UidGenerator) {
 
 func init() {
 	Store = storeObj{}
+	Tenants = tenantsMapper{}
 	Users = usersMapper{}
 	Topics = topicsMapper{}
 	Subs = subsMapper{}

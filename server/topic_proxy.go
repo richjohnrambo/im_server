@@ -73,7 +73,7 @@ func (t *Topic) runProxy(hub *Hub) {
 			// Either an update to 'me' user agent from one of the sessions or
 			// background session comes to foreground.
 			req := ProxyReqMeUserAgent
-			tmpSess := &Session{userAgent: upd.userAgent}
+			tmpSess := &Session{tenantID: t.tenantID, userAgent: upd.userAgent}
 			if upd.sess != nil {
 				// Subscribed user may not match session user. Find out who is subscribed
 				pssd, ok := t.sessions[upd.sess]
@@ -99,7 +99,7 @@ func (t *Topic) runProxy(hub *Hub) {
 				s.detachSession(t.name)
 			}
 
-			if err := globals.cluster.topicProxyGone(t.name); err != nil {
+			if err := globals.cluster.topicProxyGone(t.tenantID, t.name); err != nil {
 				logs.Warn.Printf("proxy topic[%s] shutdown: failed to notify master - %s", t.name, err)
 			}
 
@@ -111,7 +111,7 @@ func (t *Topic) runProxy(hub *Hub) {
 
 		case <-killTimer.C:
 			// Topic timeout
-			hub.unreg <- &topicUnreg{rcptTo: t.name}
+			hub.unreg <- &topicUnreg{tenantID: t.tenantID, rcptTo: t.name}
 		}
 	}
 }

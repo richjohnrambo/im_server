@@ -14,6 +14,15 @@ import (
 	"github.com/tinode/chat/server/store/types"
 )
 
+type testTenantStore struct {
+	tenant *types.Tenant
+	err    error
+}
+
+func (s testTenantStore) GetByCode(string) (*types.Tenant, error) {
+	return s.tenant, s.err
+}
+
 func test_makeSession(uid types.Uid) *Session {
 	return &Session{
 		send:         make(chan any, 10),
@@ -21,10 +30,21 @@ func test_makeSession(uid types.Uid) *Session {
 		authLvl:      auth.LevelAuth,
 		inflightReqs: newBoundedWaitGroup(1),
 		ver:          22,
+		tenantID:     1,
+		tenantCode:   "test",
 	}
 }
 
 func TestDispatchHello(t *testing.T) {
+	oldTenants := store.Tenants
+	store.Tenants = testTenantStore{tenant: &types.Tenant{
+		ID:    7,
+		Code:  "acme",
+		Name:  "Acme Corp",
+		State: types.TenantStateActive,
+	}}
+	defer func() { store.Tenants = oldTenants }()
+
 	s := &Session{
 		send:    make(chan any, 10),
 		uid:     types.Uid(1),
@@ -40,6 +60,7 @@ func TestDispatchHello(t *testing.T) {
 			Version:   "1",
 			UserAgent: "test-ua",
 			Lang:      "en-GB",
+			Tenant:    "acme",
 		},
 	}
 	s.dispatch(msg)
@@ -74,6 +95,64 @@ func TestDispatchHello(t *testing.T) {
 	}
 	if s.ver == 0 {
 		t.Errorf("s.ver expected 0 vs found %d", s.ver)
+	}
+	if s.tenantID != 7 || s.tenantCode != "acme" {
+		t.Errorf("unexpected tenant binding: id=%d code=%q", s.tenantID, s.tenantCode)
+	}
+	tenantParams := resp.Ctrl.Params.(map[string]any)["tenant"].(map[string]any)
+	if tenantParams["code"] != "acme" || tenantParams["name"] != "Acme Corp" {
+		t.Errorf("unexpected public tenant params: %#v", tenantParams)
+	}
+}
+
+func TestDispatchHelloRequiresTenant(t *testing.T) {
+	s := &Session{send: make(chan any, 1)}
+	s.dispatch(&ClientComMessage{Hi: &MsgClientHi{Id: "123", Version: "1"}})
+	resp := (<-s.send).(*ServerComMessage)
+	if resp.Ctrl.Code != http.StatusBadRequest {
+		t.Fatalf("response code: expected %d, got %d", http.StatusBadRequest, resp.Ctrl.Code)
+	}
+	if !s.tenantID.IsZero() || s.ver != 0 {
+		t.Fatalf("invalid hello must not bind session: tenant=%d version=%d", s.tenantID, s.ver)
+	}
+}
+
+func TestDispatchHelloRejectsInactiveTenant(t *testing.T) {
+	oldTenants := store.Tenants
+	store.Tenants = testTenantStore{tenant: &types.Tenant{
+		ID:    7,
+		Code:  "acme",
+		Name:  "Acme Corp",
+		State: types.TenantStateSuspended,
+	}}
+	defer func() { store.Tenants = oldTenants }()
+
+	s := &Session{send: make(chan any, 1)}
+	s.dispatch(&ClientComMessage{Hi: &MsgClientHi{Id: "123", Version: "1", Tenant: "acme"}})
+	resp := (<-s.send).(*ServerComMessage)
+	if resp.Ctrl.Code != http.StatusForbidden {
+		t.Fatalf("response code: expected %d, got %d", http.StatusForbidden, resp.Ctrl.Code)
+	}
+	if !s.tenantID.IsZero() || s.ver != 0 {
+		t.Fatalf("inactive tenant must not bind session: tenant=%d version=%d", s.tenantID, s.ver)
+	}
+}
+
+func TestDispatchHelloRejectsTenantChange(t *testing.T) {
+	s := &Session{
+		send:       make(chan any, 1),
+		uid:        1,
+		ver:        parseVersion("1"),
+		tenantID:   7,
+		tenantCode: "acme",
+	}
+	s.dispatch(&ClientComMessage{Hi: &MsgClientHi{Id: "123", Version: "1", Tenant: "other"}})
+	resp := (<-s.send).(*ServerComMessage)
+	if resp.Ctrl.Code != http.StatusConflict {
+		t.Fatalf("response code: expected %d, got %d", http.StatusConflict, resp.Ctrl.Code)
+	}
+	if s.tenantID != 7 || s.tenantCode != "acme" {
+		t.Fatalf("tenant binding changed: tenant=%d code=%q", s.tenantID, s.tenantCode)
 	}
 }
 
@@ -155,13 +234,14 @@ func TestDispatchLogin(t *testing.T) {
 
 	secret := "<==auth-secret==>"
 	authRec := &auth.Rec{
+		TenantID:  1,
 		Uid:       uid,
 		AuthLevel: auth.LevelAuth,
 		Tags:      []string{"tag1", "tag2"},
 		State:     types.StateOK,
 	}
 	ss.EXPECT().GetLogicalAuthHandler("basic").Return(aa)
-	aa.EXPECT().Authenticate([]byte(secret), gomock.Any()).Return(authRec, nil, nil)
+	aa.EXPECT().Authenticate(auth.AuthContext{TenantID: 1}, []byte(secret)).Return(authRec, nil, nil)
 	// Token generation.
 	ss.EXPECT().GetLogicalAuthHandler("token").Return(aa)
 	token := "<==auth-token==>"
@@ -169,9 +249,11 @@ func TestDispatchLogin(t *testing.T) {
 	aa.EXPECT().GenSecret(authRec).Return([]byte(token), expires, nil)
 
 	s := &Session{
-		send:    make(chan any, 10),
-		authLvl: auth.LevelAuth,
-		ver:     16,
+		send:       make(chan any, 10),
+		authLvl:    auth.LevelAuth,
+		ver:        16,
+		tenantID:   1,
+		tenantCode: "test",
 	}
 	wg := sync.WaitGroup{}
 	r := responses{}
@@ -216,6 +298,68 @@ func TestDispatchLogin(t *testing.T) {
 		}
 	} else {
 		t.Error("Response must contain a ctrl message.")
+	}
+}
+
+func TestDispatchLoginRejectsAuthenticatorTenantMismatch(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	ss := mock_store.NewMockPersistentStorageInterface(ctrl)
+	aa := mock_auth.NewMockAuthHandler(ctrl)
+	store.Store = ss
+	defer func() {
+		store.Store = nil
+		ctrl.Finish()
+	}()
+
+	secret := []byte("alice:password")
+	ss.EXPECT().GetLogicalAuthHandler("basic").Return(aa)
+	aa.EXPECT().Authenticate(auth.AuthContext{TenantID: 1}, secret).Return(&auth.Rec{
+		TenantID:  2,
+		Uid:       42,
+		AuthLevel: auth.LevelAuth,
+		State:     types.StateOK,
+	}, nil, nil)
+
+	s := &Session{send: make(chan any, 1), ver: 16, tenantID: 1, tenantCode: "acme"}
+	s.login(&ClientComMessage{
+		Login:     &MsgClientLogin{Id: "login-1", Scheme: "basic", Secret: secret},
+		Timestamp: time.Now(),
+	})
+
+	resp := (<-s.send).(*ServerComMessage)
+	if resp.Ctrl == nil || resp.Ctrl.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if !s.uid.IsZero() {
+		t.Fatalf("tenant mismatch authenticated session as %s", s.uid.UserId())
+	}
+}
+
+func TestDispatchRejectsCrossTenantAsUser(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	users := mock_store.NewMockUsersPersistenceInterface(ctrl)
+	oldUsers := store.Users
+	store.Users = users
+	defer func() {
+		store.Users = oldUsers
+		ctrl.Finish()
+	}()
+
+	target := types.Uid(42)
+	users.EXPECT().Get(types.TenantID(1), target).Return(&types.User{TenantID: 2, State: types.StateOK}, nil)
+	s := &Session{
+		send:       make(chan any, 1),
+		uid:        1,
+		authLvl:    auth.LevelRoot,
+		ver:        16,
+		tenantID:   1,
+		tenantCode: "acme",
+	}
+	s.dispatch(&ClientComMessage{Extra: &MsgClientExtra{AsUser: target.UserId()}})
+
+	resp := (<-s.send).(*ServerComMessage)
+	if resp.Ctrl == nil || resp.Ctrl.Code != http.StatusForbidden {
+		t.Fatalf("unexpected response: %+v", resp)
 	}
 }
 
@@ -1062,6 +1206,7 @@ func TestDispatchAccNew(t *testing.T) {
 	secret := "<==auth-secret==>"
 	tags := []string{"tag1", "tag2"}
 	authRec := &auth.Rec{
+		TenantID:  1,
 		Uid:       uid,
 		AuthLevel: auth.LevelAuth,
 		Tags:      tags,
@@ -1069,24 +1214,27 @@ func TestDispatchAccNew(t *testing.T) {
 	}
 	ss.EXPECT().GetLogicalAuthHandler("basic").Return(aa)
 	// This login is available.
-	aa.EXPECT().IsUnique([]byte(secret), remoteAddr).Return(true, nil)
-	uu.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(user *types.User, private any) (*types.User, error) {
+	aa.EXPECT().IsUnique(auth.AuthContext{TenantID: 1, RemoteAddr: remoteAddr}, []byte(secret)).Return(true, nil)
+	uu.EXPECT().Create(types.TenantID(1), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ types.TenantID, user *types.User, private any) (*types.User, error) {
 			user.SetUid(uid)
 			return user, nil
 		})
-	aa.EXPECT().AddRecord(gomock.Any(), []byte(secret), remoteAddr).Return(authRec, nil)
+	aa.EXPECT().AddRecord(auth.AuthContext{TenantID: 1, RemoteAddr: remoteAddr}, gomock.Any(),
+		[]byte(secret)).Return(authRec, nil)
 
 	// Token generation.
 	ss.EXPECT().GetLogicalAuthHandler("token").Return(aa)
 	token := "<==auth-token==>"
 	aa.EXPECT().GenSecret(gomock.Any()).Return([]byte(token), time.Now(), nil)
-	uu.EXPECT().UpdateTags(uid, tags, nil, nil).Return(tags, nil)
+	uu.EXPECT().UpdateTags(types.TenantID(1), uid, tags, nil, nil).Return(tags, nil)
 
 	s := &Session{
 		send:       make(chan any, 10),
 		authLvl:    auth.LevelAuth,
 		ver:        16,
+		tenantID:   1,
+		tenantCode: "test",
 		remoteAddr: remoteAddr,
 	}
 	wg := sync.WaitGroup{}
@@ -1148,6 +1296,8 @@ func TestDispatchNoMessage(t *testing.T) {
 		send:       make(chan any, 10),
 		authLvl:    auth.LevelAuth,
 		ver:        16,
+		tenantID:   1,
+		tenantCode: "test",
 		remoteAddr: remoteAddr,
 	}
 	wg := sync.WaitGroup{}

@@ -31,6 +31,8 @@ var outgoingMessageSizeDistribution = []float64{1, 2, 4, 8, 16, 32, 64, 128, 256
 
 // Request to hub to remove the topic
 type topicUnreg struct {
+	// Tenant which owns the topic.
+	tenantID types.TenantID
 	// Original request, could be nil.
 	pkt *ClientComMessage
 	// Session making the request, could be nil.
@@ -46,6 +48,8 @@ type topicUnreg struct {
 }
 
 type userStatusReq struct {
+	// Tenant which owns the user.
+	tenantID types.TenantID
 	// UID of the user being affected.
 	forUser types.Uid
 	// New topic state value. Only types.StateSuspended is supported at this time.
@@ -86,21 +90,30 @@ type Hub struct {
 	shutdown chan chan<- bool
 }
 
-func (h *Hub) topicGet(name string) *Topic {
-	if t, ok := h.topics.Load(name); ok {
+func (h *Hub) topicGet(key types.TopicKey) *Topic {
+	if !key.IsValid() {
+		return nil
+	}
+	if t, ok := h.topics.Load(key); ok {
 		return t.(*Topic)
 	}
 	return nil
 }
 
-func (h *Hub) topicPut(name string, t *Topic) {
+func (h *Hub) topicPut(key types.TopicKey, t *Topic) {
+	if !key.IsValid() || t == nil || t.tenantID != key.TenantID || t.name != key.Topic {
+		panic("invalid tenant topic key")
+	}
 	h.numTopics++
-	h.topics.Store(name, t)
+	h.topics.Store(key, t)
 }
 
-func (h *Hub) topicDel(name string) {
+func (h *Hub) topicDel(key types.TopicKey) {
+	if !key.IsValid() {
+		return
+	}
 	h.numTopics--
-	h.topics.Delete(name)
+	h.topics.Delete(key)
 }
 
 func newHub() *Hub {
@@ -142,9 +155,6 @@ func newHub() *Hub {
 
 	go h.run()
 
-	// Initialize 'sys' topic. It will be initialized either as master or proxy.
-	h.join <- &ClientComMessage{RcptTo: "sys", Original: "sys"}
-
 	return h
 }
 
@@ -152,6 +162,13 @@ func (h *Hub) run() {
 	for {
 		select {
 		case join := <-h.join:
+			if !join.TenantID.IsValid() {
+				logs.Warn.Println("hub.join: missing tenant context", join.RcptTo)
+				if join.sess != nil {
+					join.sess.queueOut(ErrMalformedReply(join, join.Timestamp))
+				}
+				continue
+			}
 			// Handle a subscription request:
 			// 1. Init topic
 			// 1.1 If a new topic is requested, create it
@@ -162,14 +179,16 @@ func (h *Hub) run() {
 			// 2. Check access rights and reject, if appropriate
 			// 3. Attach session to the topic
 			// Is the topic already loaded?
-			t := h.topicGet(join.RcptTo)
+			key := types.TopicKey{TenantID: join.TenantID, Topic: join.RcptTo}
+			t := h.topicGet(key)
 			if t == nil {
 				// Topic does not exist or not loaded.
 				t = &Topic{
+					tenantID:  join.TenantID,
 					name:      join.RcptTo,
 					xoriginal: join.Original,
 					// Indicates a proxy topic.
-					isProxy:   globals.cluster.isRemoteTopic(join.RcptTo),
+					isProxy:   globals.cluster.isRemoteTopic(key),
 					sessions:  make(map[*Session]perSessionData),
 					clientMsg: make(chan *ClientComMessage, 192),
 					serverMsg: make(chan *ServerComMessage, 64),
@@ -182,7 +201,7 @@ func (h *Hub) run() {
 				if globals.cluster != nil {
 					if t.isProxy {
 						t.proxy = make(chan *ClusterResp, 128)
-						t.masterNode = globals.cluster.ring.Get(t.name)
+						t.masterNode = globals.cluster.ring.Get(key.RoutingKey())
 					} else {
 						// It's a master topic. Make a channel for handling
 						// direct messages from the proxy.
@@ -192,7 +211,7 @@ func (h *Hub) run() {
 				// Topic is created in suspended state because it's not yet configured.
 				t.markPaused(true)
 				// Save topic now to prevent race condition.
-				h.topicPut(join.RcptTo, t)
+				h.topicPut(key, t)
 
 				// Configure the topic.
 				go topicInit(t, join, h)
@@ -222,7 +241,8 @@ func (h *Hub) run() {
 		case msg := <-h.routeCli:
 			// This is a message from a session not subscribed to topic
 			// Route incoming message to topic if topic permits such routing.
-			if dst := h.topicGet(msg.RcptTo); dst != nil {
+			key := types.TopicKey{TenantID: msg.TenantID, Topic: msg.RcptTo}
+			if dst := h.topicGet(key); dst != nil {
 				// Everything is OK, sending packet to known topic
 				if dst.clientMsg != nil {
 					select {
@@ -247,7 +267,8 @@ func (h *Hub) run() {
 		case msg := <-h.routeSrv:
 			// This is a server message from a connection not subscribed to topic
 			// Route incoming message to topic if topic permits such routing.
-			if dst := h.topicGet(msg.RcptTo); dst != nil {
+			key := types.TopicKey{TenantID: msg.TenantID, Topic: msg.RcptTo}
+			if dst := h.topicGet(key); dst != nil {
 				// Everything is OK, sending packet to known topic
 				select {
 				case dst.serverMsg <- msg:
@@ -255,7 +276,7 @@ func (h *Hub) run() {
 					logs.Err.Println("hub: topic's broadcast queue is full", dst.name)
 				}
 			} else if (strings.HasPrefix(msg.RcptTo, "usr") || strings.HasPrefix(msg.RcptTo, "grp")) &&
-				globals.cluster.isRemoteTopic(msg.RcptTo) {
+				globals.cluster.isRemoteTopic(key) {
 				// It is a remote topic.
 				if err := globals.cluster.routeToTopicIntraCluster(msg.RcptTo, msg, msg.sess); err != nil {
 					logs.Warn.Printf("hub: routing to '%s' failed", msg.RcptTo)
@@ -275,7 +296,7 @@ func (h *Hub) run() {
 
 		case status := <-h.userStatus:
 			// Suspend/activate user's topics.
-			go h.topicsStateForUser(status.forUser, status.state == types.StateSuspended)
+			go h.topicsStateForUser(status.tenantID, status.forUser, status.state == types.StateSuspended)
 
 		case unreg := <-h.unreg:
 			reason := StopNone
@@ -284,12 +305,12 @@ func (h *Hub) run() {
 			}
 			if unreg.forUser.IsZero() {
 				// The topic is being garbage collected or deleted.
-				if err := h.topicUnreg(unreg.sess, unreg.rcptTo, unreg.pkt, reason); err != nil {
+				if err := h.topicUnreg(unreg.tenantID, unreg.sess, unreg.rcptTo, unreg.pkt, reason); err != nil {
 					logs.Err.Println("hub.topicUnreg failed:", err)
 				}
 			} else {
 				// User is being deleted.
-				go h.stopTopicsForUser(unreg.forUser, reason, unreg.done)
+				go h.stopTopicsForUser(unreg.tenantID, unreg.forUser, reason, unreg.done)
 			}
 
 		case <-h.rehash:
@@ -302,20 +323,12 @@ func (h *Hub) run() {
 				// 1. Master topic has moved out to another node.
 				// 2. Proxy topic is running on a new master node
 				//    (i.e. the master topic has moved to this node).
-				if topic.isProxy != globals.cluster.isRemoteTopic(topic.name) {
-					h.topicUnreg(nil, topic.name, nil, StopRehashing)
+				key := types.TopicKey{TenantID: topic.tenantID, Topic: topic.name}
+				if topic.isProxy != globals.cluster.isRemoteTopic(key) {
+					h.topicUnreg(topic.tenantID, nil, topic.name, nil, StopRehashing)
 				}
 				return true
 			})
-
-			// Check if 'sys' topic has migrated to this node.
-			if h.topicGet("sys") == nil && !globals.cluster.isRemoteTopic("sys") {
-				// Yes, 'sys' has migrated here. Initialize it.
-				// The h.join is unbuffered. We must call from another goroutine. Otherwise deadlock.
-				go func() {
-					h.join <- &ClientComMessage{RcptTo: "sys", Original: "sys"}
-				}()
-			}
 
 		case hubdone := <-h.shutdown:
 			// start cleanup process
@@ -347,9 +360,12 @@ func (h *Hub) run() {
 // * all p2p topics with the given user
 // * group topics where the given user is the owner.
 // 'me' and fnd' are ignored here because they are direcly tied to the user object.
-func (h *Hub) topicsStateForUser(uid types.Uid, suspended bool) {
+func (h *Hub) topicsStateForUser(tenantID types.TenantID, uid types.Uid, suspended bool) {
 	h.topics.Range(func(name any, t any) bool {
 		topic := t.(*Topic)
+		if topic.tenantID != tenantID {
+			return true
+		}
 		if topic.cat == types.TopicCatMe || topic.cat == types.TopicCatFnd {
 			return true
 		}
@@ -389,8 +405,9 @@ func (h *Hub) topicsStateForUser(uid types.Uid, suspended bool) {
 
 // 2. Topic is just being unregistered (topic is going offline)
 // 2.1 Unregister it with no further action
-func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, reason int) error {
+func (h *Hub) topicUnreg(tenantID types.TenantID, sess *Session, topic string, msg *ClientComMessage, reason int) error {
 	now := types.TimeNow()
+	key := types.TopicKey{TenantID: tenantID, Topic: topic}
 
 	// TODO: when channel is deleted unsubscribe all devices from channel's FCM topic.
 
@@ -400,7 +417,7 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 			asUid = types.ParseUserId(msg.AsUser)
 		}
 		// Case 1 (unregister and delete)
-		if t := h.topicGet(topic); t != nil {
+		if t := h.topicGet(key); t != nil {
 			// Case 1.1: topic is online
 			if (!asUid.IsZero() && t.owner == asUid) || (t.cat == types.TopicCatP2P && t.subsCount() < 2) {
 				// Case 1.1.1: requester is the owner or last sub in a p2p topic
@@ -410,7 +427,7 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 					// Soft-deleting does not make sense for p2p topics.
 					hard = msg.Del.Hard || t.cat == types.TopicCatP2P
 				}
-				if err := store.Topics.Delete(topic, t.isChan, hard); err != nil {
+				if err := store.Topics.Delete(tenantID, topic, t.isChan, hard); err != nil {
 					t.markPaused(false)
 					if sess != nil {
 						sess.queueOut(ErrUnknownReply(msg, now))
@@ -423,10 +440,10 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 
 				if t.isChan {
 					// Notify channel subscribers that the channel is deleted.
-					sendPush(pushForChanDelete(t.name, now))
+					sendPush(pushForChanDelete(t.tenantID, t.name, now))
 				}
 
-				h.topicDel(topic)
+				h.topicDel(key)
 				t.markDeleted()
 				t.exit <- &shutDown{reason: StopDeleted}
 				statsInc("LiveTopics", -1)
@@ -448,7 +465,7 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 
 			// Get all subscribers of non-channel topics: we need to know how many are left and notify them.
 			// Get only one subscription for channel users.
-			subs, err := store.Topics.GetSubs(topic, opts)
+			subs, err := store.Topics.GetSubs(tenantID, topic, opts)
 			if err != nil {
 				sess.queueOut(ErrUnknownReply(msg, now))
 				return err
@@ -458,7 +475,7 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 			if len(subs) == 0 {
 				if tcat == types.TopicCatP2P {
 					// No subscribers: delete.
-					store.Topics.Delete(topic, false, true)
+					store.Topics.Delete(tenantID, topic, false, true)
 				}
 				sess.queueOut(InfoNoActionReply(msg, now))
 				return nil
@@ -485,13 +502,13 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 
 				if tcat == types.TopicCatP2P && len(subs) < 2 {
 					// This is a P2P topic and fewer than 2 subscriptions, delete the entire topic
-					if err := store.Topics.Delete(topic, false, msg.Del.Hard); err != nil {
+					if err := store.Topics.Delete(tenantID, topic, false, msg.Del.Hard); err != nil {
 						sess.queueOut(ErrUnknownReply(msg, now))
 						return err
 					}
 					// Inform plugin that the topic was deleted.
-					pluginTopic(&Topic{name: topic}, plgActDel)
-				} else if err := store.Subs.Delete(topic, asUid); err != nil {
+					pluginTopic(&Topic{tenantID: tenantID, name: topic}, plgActDel)
+				} else if err := store.Subs.Delete(tenantID, topic, asUid); err != nil {
 					// Not P2P or more than 1 subscription left.
 					// Delete user's own subscription only
 					if err == types.ErrNotFound {
@@ -504,37 +521,38 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 				}
 
 				// Notify user's other sessions that the subscription is gone
-				presSingleUserOfflineOffline(asUid, msg.Original, "gone", nilPresParams, sess.sid)
+				presSingleUserOfflineOffline(tenantID, asUid, msg.Original, "gone", nilPresParams, sess.sid)
 				if tcat == types.TopicCatP2P && len(subs) == 2 {
 					uname1 := asUid.UserId()
 					uid2 := types.ParseUserId(msg.Original)
 					// Tell user1 to stop sending updates to user2 without passing change to user1's sessions.
-					presSingleUserOfflineOffline(asUid, uid2.UserId(), "?none+rem", nilPresParams, "")
+					presSingleUserOfflineOffline(tenantID, asUid, uid2.UserId(), "?none+rem", nilPresParams, "")
 					// Don't change the online status of user1, just ask user2 to stop notification exchange.
 					// Tell user2 that user1 is offline but let him keep sending updates in case user1 resubscribes.
-					presSingleUserOfflineOffline(uid2, uname1, "off", nilPresParams, "")
+					presSingleUserOfflineOffline(tenantID, uid2, uname1, "off", nilPresParams, "")
 				}
 
 				// Inform plugin that the subscription was deleted.
+				sub.TenantID = tenantID
 				pluginSubscription(sub, plgActDel)
 			} else {
 				// Case 1.2.1.1: owner, delete the group topic from db. Only group topics have owners.
 				// We don't know if the group topic is a channel, but cleaning it as a channel does no harm
 				// other than a small performance penalty.
-				if err := store.Topics.Delete(topic, true, msg.Del.Hard); err != nil {
+				if err := store.Topics.Delete(tenantID, topic, true, msg.Del.Hard); err != nil {
 					sess.queueOut(ErrUnknownReply(msg, now))
 					return err
 				}
 
 				// Notify subscribers that the group topic is gone.
-				presSubsOfflineOffline(topic, tcat, subs, "gone", &presParams{}, sess.sid)
+				presSubsOfflineOffline(tenantID, topic, tcat, subs, "gone", &presParams{}, sess.sid)
 
 				// Notify channel subscribers that the channel is deleted.
 				// The push will not be delivered to anybody if the topic is not a channel.
-				sendPush(pushForChanDelete(topic, now))
+				sendPush(pushForChanDelete(tenantID, topic, now))
 
 				// Inform plugin that the topic was deleted.
-				pluginTopic(&Topic{name: topic}, plgActDel)
+				pluginTopic(&Topic{tenantID: tenantID, name: topic}, plgActDel)
 			}
 
 			sess.queueOut(NoErrReply(msg, now))
@@ -542,9 +560,9 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 	} else {
 		// Case 2: just unregister.
 		// If t is nil, it's not registered, no action is needed
-		if t := h.topicGet(topic); t != nil {
+		if t := h.topicGet(key); t != nil {
 			t.markDeleted()
-			h.topicDel(topic)
+			h.topicDel(key)
 
 			t.exit <- &shutDown{reason: reason}
 
@@ -564,7 +582,7 @@ func (h *Hub) topicUnreg(sess *Session, topic string, msg *ClientComMessage, rea
 // * all p2p topics with the given user
 // * group topics where the given user is the owner.
 // * user's 'me', 'fnd', 'slf' topics.
-func (h *Hub) stopTopicsForUser(uid types.Uid, reason int, alldone chan<- bool) {
+func (h *Hub) stopTopicsForUser(tenantID types.TenantID, uid types.Uid, reason int, alldone chan<- bool) {
 	var done chan bool
 	if alldone != nil {
 		done = make(chan bool, 128)
@@ -573,6 +591,9 @@ func (h *Hub) stopTopicsForUser(uid types.Uid, reason int, alldone chan<- bool) 
 	count := 0
 	h.topics.Range(func(name any, t any) bool {
 		topic := t.(*Topic)
+		if topic.tenantID != tenantID {
+			return true
+		}
 		if _, isMember := topic.perUser[uid]; (topic.cat != types.TopicCatGrp && isMember) ||
 			topic.owner == uid {
 			topic.markDeleted()
@@ -583,7 +604,7 @@ func (h *Hub) stopTopicsForUser(uid types.Uid, reason int, alldone chan<- bool) 
 
 			// Just send to p2p topics here.
 			if topic.cat == types.TopicCatP2P && len(topic.perUser) == 2 {
-				presSingleUserOfflineOffline(topic.p2pOtherUser(uid), uid.UserId(), "gone", nilPresParams, "")
+				presSingleUserOfflineOffline(tenantID, topic.p2pOtherUser(uid), uid.UserId(), "gone", nilPresParams, "")
 			}
 			count++
 		}
@@ -609,7 +630,7 @@ func replyOfflineTopicGetDesc(sess *Session, msg *ClientComMessage) {
 	topic := msg.RcptTo
 
 	if strings.HasPrefix(topic, "grp") || topic == "sys" {
-		stopic, err := store.Topics.Get(topic)
+		stopic, err := store.Topics.Get(msg.TenantID, topic)
 		if err != nil {
 			logs.Info.Println("replyOfflineTopicGetDesc", err)
 			sess.queueOut(decodeStoreErrorExplicitTs(err, msg.Id, msg.Original, now, msg.Timestamp, nil))
@@ -663,7 +684,7 @@ func replyOfflineTopicGetDesc(sess *Session, msg *ClientComMessage) {
 			return
 		}
 
-		suser, err := store.Users.Get(uid)
+		suser, err := store.Users.Get(msg.TenantID, uid)
 		if err != nil {
 			sess.queueOut(decodeStoreErrorExplicitTs(err, msg.Id, msg.Original, now, msg.Timestamp, nil))
 			return
@@ -690,7 +711,7 @@ func replyOfflineTopicGetDesc(sess *Session, msg *ClientComMessage) {
 		}
 	}
 
-	sub, err := store.Subs.Get(topic, asUid, false)
+	sub, err := store.Subs.Get(msg.TenantID, topic, asUid, false)
 	if err != nil {
 		logs.Warn.Println("replyOfflineTopicGetDesc:", err)
 		sess.queueOut(decodeStoreErrorExplicitTs(err, msg.Id, msg.Original, now, msg.Timestamp, nil))
@@ -730,7 +751,7 @@ func replyOfflineTopicGetSub(sess *Session, msg *ClientComMessage) {
 		topicName = msg.Original
 	}
 
-	ssub, err := store.Subs.Get(topicName, types.ParseUserId(msg.AsUser), true)
+	ssub, err := store.Subs.Get(msg.TenantID, topicName, types.ParseUserId(msg.AsUser), true)
 	if err != nil {
 		logs.Warn.Println("replyOfflineTopicGetSub:", err)
 		sess.queueOut(decodeStoreErrorExplicitTs(err, msg.Id, msg.Original, now, msg.Timestamp, nil))
@@ -795,7 +816,7 @@ func replyOfflineTopicSetSub(sess *Session, msg *ClientComMessage) {
 		topicName = msg.Original
 	}
 
-	sub, err := store.Subs.Get(topicName, asUid, false)
+	sub, err := store.Subs.Get(msg.TenantID, topicName, asUid, false)
 	if err != nil {
 		logs.Warn.Println("replyOfflineTopicSetSub get sub:", err)
 		sess.queueOut(decodeStoreErrorExplicitTs(err, msg.Id, msg.Original, now, msg.Timestamp, nil))
@@ -845,7 +866,7 @@ func replyOfflineTopicSetSub(sess *Session, msg *ClientComMessage) {
 	}
 
 	if len(update) > 0 {
-		err = store.Subs.Update(topicName, asUid, update)
+		err = store.Subs.Update(msg.TenantID, topicName, asUid, update)
 		if err != nil {
 			logs.Warn.Println("replyOfflineTopicSetSub update:", err)
 			sess.queueOut(decodeStoreErrorExplicitTs(err, msg.Id, msg.Original, now, msg.Timestamp, nil))

@@ -14,6 +14,40 @@ CREATE DATABASE tinode CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 
 USE tinode;
 
+CREATE TABLE im_tenant(
+	id          BIGINT NOT NULL AUTO_INCREMENT,
+	code        VARCHAR(64) NOT NULL,
+	name        VARCHAR(128) NOT NULL,
+	tenant_desc VARCHAR(256),
+	state       SMALLINT NOT NULL,
+	created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	created_by  BIGINT NOT NULL,
+	updated_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+	updated_by  BIGINT NOT NULL,
+
+	PRIMARY KEY(id),
+	UNIQUE INDEX uk_im_tenant_code(code)
+);
+
+CREATE TABLE im_tenant_config(
+	id                BIGINT NOT NULL AUTO_INCREMENT,
+	tenant_id         BIGINT NOT NULL,
+	max_users         BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 means unlimited',
+	max_groups        BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 means unlimited',
+	max_group_members INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 means unlimited',
+	created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	created_by        BIGINT NOT NULL,
+	updated_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+	updated_by        BIGINT NOT NULL,
+
+	PRIMARY KEY(id),
+	UNIQUE INDEX uk_im_tenant_config_tenant_id(tenant_id),
+	CONSTRAINT fk_im_tenant_config_tenant FOREIGN KEY(tenant_id) REFERENCES im_tenant(id) ON DELETE CASCADE
+);
+
+INSERT INTO im_tenant(code,name,tenant_desc,state,created_by,updated_by)
+VALUES('default','Default Tenant',NULL,1,0,0);
+
 
 CREATE TABLE kvmeta(
 	`key` VARCHAR(64),
@@ -23,7 +57,7 @@ CREATE TABLE kvmeta(
 	INDEX kvmeta_createdat_key(createdat, `key`)
 );
 
-INSERT INTO kvmeta(`key`, `value`) VALUES("version", "100");
+INSERT INTO kvmeta(`key`, `value`) VALUES("version", "117");
 
 CREATE TABLE users(
 	id 			BIGINT NOT NULL,

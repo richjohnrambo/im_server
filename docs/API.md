@@ -697,10 +697,11 @@ hi: {
   platf: "android", // string, underlying OS for the purpose of push notifications, one of
                    // "android", "ios", "web"; if missing, the server will try its best to
                    // detect the platform from the user agent string; optional
-  lang: "en-US"    // human language of the client device; optional
+  lang: "en-US",   // human language of the client device; optional
+  tenant: "acme"   // public enterprise code used to bind the session tenant; required
 }
 ```
-The user agent `ua` is expected to follow [RFC 7231 section 5.5.3](http://tools.ietf.org/html/rfc7231#section-5.5.3) recommendation but the format is not enforced. The message can be sent more than once to update `ua`, `dev` and `lang` values. If sent more than once, the `ver` field of the second and subsequent messages must be either unchanged or not set.
+The user agent `ua` is expected to follow [RFC 7231 section 5.5.3](http://tools.ietf.org/html/rfc7231#section-5.5.3) recommendation but the format is not enforced. The first message must include `tenant`. The resolved tenant is immutable for the lifetime of the session. The message can be sent more than once to update `ua`, `dev` and `lang` values. If sent more than once, the `ver` field of the second and subsequent messages must be either unchanged or not set, and `tenant` must be unchanged or omitted.
 
 #### `{acc}`
 

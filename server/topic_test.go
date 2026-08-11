@@ -67,11 +67,12 @@ func (b *TopicTestHelper) finish() {
 
 func (b *TopicTestHelper) newSession(sid string, uid types.Uid) (*Session, *responses) {
 	s := &Session{
-		sid:    sid,
-		uid:    uid,
-		subs:   make(map[string]*Subscription),
-		send:   make(chan any, 10),
-		detach: make(chan string, 10),
+		tenantID: 1,
+		sid:      sid,
+		uid:      uid,
+		subs:     make(map[string]*Subscription),
+		send:     make(chan any, 10),
+		detach:   make(chan string, 10),
 	}
 	r := &responses{}
 	b.sessWg.Add(1)
@@ -136,6 +137,7 @@ func (b *TopicTestHelper) setUp(t *testing.T, numUsers int, cat types.TopicCat, 
 		pu[uid] = puData
 	}
 	b.topic = &Topic{
+		tenantID:               1,
 		name:                   topicName,
 		cat:                    cat,
 		status:                 topicStatusLoaded,
@@ -198,7 +200,7 @@ func TestHandleBroadcastDataP2P(t *testing.T) {
 	helper := TopicTestHelper{}
 	helper.setUp(t, numUsers, types.TopicCatP2P, "p2p-test" /*attach=*/, true)
 	defer helper.tearDown()
-	helper.mm.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
+	helper.mm.EXPECT().Save(types.TenantID(1), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
 
 	from := helper.uids[0].UserId()
 	msg := &ClientComMessage{
@@ -283,7 +285,7 @@ func TestHandleBroadcastCall(t *testing.T) {
 	globals.iceServers = []iceServer{{Username: "dummy"}}
 	helper.topic.lastID = 5
 	defer helper.tearDown()
-	helper.mm.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
+	helper.mm.EXPECT().Save(types.TenantID(1), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
 
 	from := helper.uids[0].UserId()
 	msg := &ClientComMessage{
@@ -395,7 +397,7 @@ func TestHandleBroadcastDataGroup(t *testing.T) {
 		store.Messages = nil
 		helper.tearDown()
 	}()
-	helper.mm.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
+	helper.mm.EXPECT().Save(types.TenantID(1), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
 
 	// User 3 isn't allowed to read.
 	pu3 := helper.topic.perUser[helper.uids[3]]
@@ -555,7 +557,7 @@ func TestHandleBroadcastDataDbError(t *testing.T) {
 	defer helper.tearDown()
 
 	// DB returns an error.
-	helper.mm.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Return(types.ErrInternal, false)
+	helper.mm.EXPECT().Save(types.TenantID(1), gomock.Any(), gomock.Any(), gomock.Any()).Return(types.ErrInternal, false)
 
 	// Make test message.
 	from := helper.uids[0].UserId()
@@ -665,7 +667,7 @@ func TestHandleBroadcastInfoP2P(t *testing.T) {
 	from := helper.uids[0]
 	to := helper.uids[1]
 
-	helper.ss.EXPECT().Update(topicName, from, map[string]any{"ReadSeqId": readId}).Return(nil)
+	helper.ss.EXPECT().Update(types.TenantID(1), topicName, from, map[string]any{"ReadSeqId": readId}).Return(nil)
 
 	msg := &ClientComMessage{
 		AsUser: from.UserId(),
@@ -982,7 +984,7 @@ func TestHandleBroadcastInfoDbError(t *testing.T) {
 	from := helper.uids[0]
 	to := helper.uids[1]
 
-	helper.ss.EXPECT().Update(topicName, from, map[string]any{"ReadSeqId": readId}).Return(types.ErrInternal)
+	helper.ss.EXPECT().Update(types.TenantID(1), topicName, from, map[string]any{"ReadSeqId": readId}).Return(types.ErrInternal)
 
 	msg := &ClientComMessage{
 		AsUser:   from.UserId(),
@@ -1096,7 +1098,7 @@ func TestHandleBroadcastInfoChannelProcessing(t *testing.T) {
 		helper.topic.perUser[uid] = pud
 	}
 
-	helper.ss.EXPECT().Update(chanName, from, map[string]any{"ReadSeqId": readId}).Return(nil)
+	helper.ss.EXPECT().Update(types.TenantID(1), chanName, from, map[string]any{"ReadSeqId": readId}).Return(nil)
 
 	msg := &ClientComMessage{
 		AsUser:   from.UserId(),
@@ -1761,7 +1763,7 @@ func TestRegisterSessionNewChannelGetSubDbError(t *testing.T) {
 		sess:   s,
 	}
 
-	helper.ss.EXPECT().Get(chanName, uid, false).Return(nil, types.ErrInternal)
+	helper.ss.EXPECT().Get(types.TenantID(1), chanName, uid, false).Return(nil, types.ErrInternal)
 
 	helper.topic.registerSession(join)
 	helper.finish()
@@ -1815,7 +1817,7 @@ func TestRegisterSessionCreateSubFailed(t *testing.T) {
 		sess:    s,
 	}
 
-	helper.ss.EXPECT().Get(topicName, uid, true).Return(nil, types.ErrInternal)
+	helper.ss.EXPECT().Get(types.TenantID(1), topicName, uid, true).Return(nil, types.ErrInternal)
 
 	helper.topic.registerSession(join)
 	helper.finish()
@@ -2054,7 +2056,7 @@ func TestRegisterSessionMetadataUpdateFails(t *testing.T) {
 		sess: s,
 	}
 	// DB call fails.
-	helper.ss.EXPECT().Update(topicName, uid, gomock.Any()).Return(types.ErrInternal)
+	helper.ss.EXPECT().Update(types.TenantID(1), topicName, uid, gomock.Any()).Return(types.ErrInternal)
 
 	helper.topic.registerSession(join)
 	helper.finish()
@@ -2116,9 +2118,9 @@ func TestRegisterSessionOwnerChangeDbCallFails(t *testing.T) {
 		AuthLvl: int(auth.LevelAuth),
 		sess:    s,
 	}
-	helper.ss.EXPECT().Update(topicName, uid, gomock.Any()).Return(nil).Times(2)
+	helper.ss.EXPECT().Update(types.TenantID(1), topicName, uid, gomock.Any()).Return(nil).Times(2)
 	// OwnerChange call fails.
-	helper.tt.EXPECT().OwnerChange(topicName, uid).Return(types.ErrInternal)
+	helper.tt.EXPECT().OwnerChange(types.TenantID(1), topicName, uid).Return(types.ErrInternal)
 
 	helper.topic.registerSession(join)
 	helper.finish()
@@ -2150,7 +2152,7 @@ func TestUnregisterSessionSimple(t *testing.T) {
 	defer helper.tearDown()
 
 	uid := helper.uids[0]
-	helper.uu.EXPECT().UpdateLastSeen(uid, gomock.Any(), gomock.Any()).Return(nil)
+	helper.uu.EXPECT().UpdateLastSeen(types.TenantID(1), uid, gomock.Any(), gomock.Any()).Return(nil)
 
 	// Add a couple more sessions.
 	for i := 1; i < 3; i++ {
@@ -2274,7 +2276,7 @@ func TestUnregisterSessionUnsubscribe(t *testing.T) {
 	defer helper.tearDown()
 
 	uid := helper.uids[2]
-	helper.ss.EXPECT().Delete(topicName, uid).Return(nil)
+	helper.ss.EXPECT().Delete(types.TenantID(1), topicName, uid).Return(nil)
 
 	// Add a couple more sessions.
 	for i := range 2 {
@@ -2449,7 +2451,7 @@ func TestUnregisterSessionUnsubDeleteCallFails(t *testing.T) {
 		init:   true,
 	}
 	// DB call fails.
-	helper.ss.EXPECT().Delete(topicName, uid).Return(types.ErrInternal)
+	helper.ss.EXPECT().Delete(types.TenantID(1), topicName, uid).Return(types.ErrInternal)
 
 	helper.topic.unregisterSession(leave)
 	helper.finish()
@@ -2518,9 +2520,9 @@ func TestHandleMetaGet(t *testing.T) {
 	defer helper.tearDown()
 
 	uid := helper.uids[0]
-	helper.mm.EXPECT().GetAll(topicName, uid, gomock.Any()).Return([]types.Message{}, nil)
-	helper.mm.EXPECT().GetDeleted(topicName, uid, gomock.Any()).Return([]types.Range{}, 0, nil)
-	helper.uu.EXPECT().GetTopics(uid, gomock.Any()).Return([]types.Subscription{}, nil)
+	helper.mm.EXPECT().GetAll(types.TenantID(1), topicName, uid, gomock.Any()).Return([]types.Message{}, nil)
+	helper.mm.EXPECT().GetDeleted(types.TenantID(1), topicName, uid, gomock.Any()).Return([]types.Range{}, 0, nil)
+	helper.uu.EXPECT().GetTopics(types.TenantID(1), uid, gomock.Any()).Return([]types.Subscription{}, nil)
 
 	meta := &ClientComMessage{
 		Get: &MsgClientGet{
@@ -2604,8 +2606,8 @@ func TestHandleMetaSetDescMePublicPrivate(t *testing.T) {
 
 	uid := helper.uids[0]
 	gomock.InOrder(
-		helper.uu.EXPECT().Update(uid, SupersetOf(map[string]string{"Public": "new public"})).Return(nil),
-		helper.ss.EXPECT().Update(topicName, uid, map[string]any{"Private": "new private"}).Return(nil),
+		helper.uu.EXPECT().Update(types.TenantID(1), uid, SupersetOf(map[string]string{"Public": "new public"})).Return(nil),
+		helper.ss.EXPECT().Update(types.TenantID(1), topicName, uid, map[string]any{"Private": "new private"}).Return(nil),
 	)
 
 	meta := &ClientComMessage{
@@ -2874,7 +2876,7 @@ func TestHandleBroadcastDataWithAttachments(t *testing.T) {
 	helper := TopicTestHelper{}
 	helper.setUp(t, numUsers, types.TopicCatP2P, "p2p-test", true)
 	defer helper.tearDown()
-	helper.mm.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
+	helper.mm.EXPECT().Save(types.TenantID(1), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
 
 	from := helper.uids[0].UserId()
 	msg := &ClientComMessage{
@@ -2939,7 +2941,7 @@ func TestHandleBroadcastInfoChannelWithMultipleReaders(t *testing.T) {
 		helper.topic.perUser[uid] = pud
 	}
 
-	helper.ss.EXPECT().Update(chanName, from, map[string]any{"ReadSeqId": readId}).Return(nil)
+	helper.ss.EXPECT().Update(types.TenantID(1), chanName, from, map[string]any{"ReadSeqId": readId}).Return(nil)
 
 	msg := &ClientComMessage{
 		AsUser:   from.UserId(),
@@ -3008,7 +3010,7 @@ func TestRegisterSessionWithComplexModeString(t *testing.T) {
 		sess:    s,
 	}
 
-	helper.ss.EXPECT().Update(topicName, uid, gomock.Any()).Return(nil)
+	helper.ss.EXPECT().Update(types.TenantID(1), topicName, uid, gomock.Any()).Return(nil)
 
 	helper.topic.registerSession(join)
 	helper.finish()
@@ -3037,7 +3039,7 @@ func TestHandleBroadcastDataGroupWithMutedUser(t *testing.T) {
 	helper := TopicTestHelper{}
 	helper.setUp(t, numUsers, types.TopicCatGrp, topicName, true)
 	defer helper.tearDown()
-	helper.mm.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
+	helper.mm.EXPECT().Save(types.TenantID(1), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
 
 	// User 2 has muted the topic (no Pres permission)
 	pu2 := helper.topic.perUser[helper.uids[2]]
@@ -3101,7 +3103,7 @@ func TestUnregisterSessionWithPendingCall(t *testing.T) {
 		isOriginator: true,
 		sess:         s,
 	}
-	helper.mm.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
+	helper.mm.EXPECT().Save(types.TenantID(1), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, true)
 
 	leave := &ClientComMessage{
 		Leave: &MsgClientLeave{
@@ -3192,7 +3194,7 @@ func TestReplyDelMsgHardDelete(t *testing.T) {
 
 	pud1 := helper.topic.perUser[user1]
 	pud1.readID = 10
-	pud1.modeGiven = types.ModeCFull  // Full permissions including delete
+	pud1.modeGiven = types.ModeCFull // Full permissions including delete
 	pud1.modeWant = types.ModeCFull
 	helper.topic.perUser[user1] = pud1
 
@@ -3205,7 +3207,7 @@ func TestReplyDelMsgHardDelete(t *testing.T) {
 	// Simulate user1 doing a hard delete of messages 7 and 8
 	msg := &ClientComMessage{
 		Del: &MsgClientDel{
-			Id: "del123",
+			Id:   "del123",
 			What: "msg",
 			DelSeq: []MsgRange{
 				{LowId: 7, HiId: 9}, // Deletes messages 7 and 8 [7, 9)
@@ -3218,7 +3220,7 @@ func TestReplyDelMsgHardDelete(t *testing.T) {
 	}
 
 	// Mock the message deletion for hard delete (forUser = types.ZeroUid)
-	helper.mm.EXPECT().DeleteList(topicName, 1, types.ZeroUid, gomock.Any(), []types.Range{{Low: 7, Hi: 9}}).Return(nil)
+	helper.mm.EXPECT().DeleteList(types.TenantID(1), topicName, 1, types.ZeroUid, gomock.Any(), []types.Range{{Low: 7, Hi: 9}}).Return(nil)
 
 	// Call the function under test
 	err := helper.topic.replyDelMsg(helper.sessions[0], user1, false, msg)
@@ -3260,17 +3262,17 @@ func TestReplyDelMsgUpdatesUnreadCounters(t *testing.T) {
 	helper.topic.lastID = 10
 
 	pud1 := helper.topic.perUser[user1]
-	pud1.readID = 10  // user1 has read all
+	pud1.readID = 10 // user1 has read all
 	helper.topic.perUser[user1] = pud1
 
 	pud2 := helper.topic.perUser[user2]
-	pud2.readID = 5   // user2 has 5 unread messages
+	pud2.readID = 5 // user2 has 5 unread messages
 	helper.topic.perUser[user2] = pud2
 
 	// Simulate user1 deleting messages 7 and 8 (2 of user2's unread messages)
 	msg := &ClientComMessage{
 		Del: &MsgClientDel{
-			Id: "del123",
+			Id:   "del123",
 			What: "msg",
 			DelSeq: []MsgRange{
 				{LowId: 7, HiId: 9}, // Deletes messages 7 and 8 [7, 9)
@@ -3283,7 +3285,7 @@ func TestReplyDelMsgUpdatesUnreadCounters(t *testing.T) {
 	}
 
 	// Mock the message deletion
-	helper.mm.EXPECT().DeleteList(topicName, 1, user1, time.Duration(0), []types.Range{{Low: 7, Hi: 9}}).Return(nil)
+	helper.mm.EXPECT().DeleteList(types.TenantID(1), topicName, 1, user1, time.Duration(0), []types.Range{{Low: 7, Hi: 9}}).Return(nil)
 
 	// Call the function under test
 	err := helper.topic.replyDelMsg(helper.sessions[0], user1, false, msg)

@@ -75,27 +75,30 @@ func (ca *authenticator) IsInitialized() bool {
 }
 
 // AddRecord is not supported, will produce an error.
-func (authenticator) AddRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
+func (authenticator) AddRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
 	return nil, types.ErrUnsupported
 }
 
 // UpdateRecord is not supported, will produce an error.
-func (authenticator) UpdateRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
+func (authenticator) UpdateRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
 	return nil, types.ErrUnsupported
 }
 
 // Authenticate checks validity of provided short code.
 // The secret is structured as <code>:<cred_method>:<cred_value>, "123456:email:alice@example.com".
-func (ca *authenticator) Authenticate(secret []byte, remoteAddr string) (*auth.Rec, []byte, error) {
+func (ca *authenticator) Authenticate(ctx auth.AuthContext, secret []byte) (*auth.Rec, []byte, error) {
+	if !ctx.IsValid() {
+		return nil, nil, types.ErrMalformed
+	}
 	parts := strings.SplitN(string(secret), ":", 2)
 	if len(parts) != 2 {
 		return nil, nil, types.ErrMalformed
 	}
 
 	code, cred := parts[0], parts[1]
-	key := sanitizeKey(realName + "_" + cred)
+	key := cacheKey(ctx.TenantID, cred)
 
-	value, err := store.PCache.Get(key)
+	value, err := store.PCache.Get(ctx.TenantID, key)
 	if err != nil {
 		if err == types.ErrNotFound {
 			err = types.ErrFailed
@@ -120,16 +123,17 @@ func (ca *authenticator) Authenticate(secret []byte, remoteAddr string) (*auth.R
 
 	if parts[0] != code {
 		// Update count of attempts. If the update fails, the error is ignored.
-		store.PCache.Upsert(key, parts[0]+":"+strconv.Itoa(count+1)+":"+parts[2], false)
+		store.PCache.Upsert(ctx.TenantID, key, parts[0]+":"+strconv.Itoa(count+1)+":"+parts[2], false)
 		return nil, nil, types.ErrFailed
 	}
 
 	// Success. Remove no longer needed entry. The error is ignored here.
-	if err = store.PCache.Delete(key); err != nil {
+	if err = store.PCache.Delete(ctx.TenantID, key); err != nil {
 		logs.Warn.Println("code_auth: error deleting key", key, err)
 	}
 
 	return &auth.Rec{
+		TenantID:   ctx.TenantID,
 		Uid:        types.ParseUid(parts[2]),
 		AuthLevel:  auth.LevelNone,
 		Lifetime:   auth.Duration(ca.lifetime),
@@ -140,8 +144,11 @@ func (ca *authenticator) Authenticate(secret []byte, remoteAddr string) (*auth.R
 
 // GenSecret generates a new code.
 func (ca *authenticator) GenSecret(rec *auth.Rec) ([]byte, time.Time, error) {
+	if rec == nil || rec.TenantID.IsZero() {
+		return nil, time.Time{}, types.ErrMalformed
+	}
 	// Run garbage collection.
-	store.PCache.Expire(realName+"_", time.Now().UTC().Add(-ca.lifetime))
+	store.PCache.Expire(rec.TenantID, cachePrefix(rec.TenantID), time.Now().UTC().Add(-ca.lifetime))
 
 	// Generate random code.
 	code, err := rand.Int(rand.Reader, ca.maxCodeValue)
@@ -160,7 +167,7 @@ func (ca *authenticator) GenSecret(rec *auth.Rec) ([]byte, time.Time, error) {
 	}
 
 	// Save "code:counter:uid" to the database. The key is code_<credential>.
-	if err = store.PCache.Upsert(sanitizeKey(realName+"_"+rec.Credential), resp+":0:"+rec.Uid.String(), true); err != nil {
+	if err = store.PCache.Upsert(rec.TenantID, cacheKey(rec.TenantID, rec.Credential), resp+":0:"+rec.Uid.String(), true); err != nil {
 		return nil, time.Time{}, err
 	}
 
@@ -175,12 +182,12 @@ func (authenticator) AsTag(token string) string {
 }
 
 // IsUnique is not supported, will produce an error.
-func (authenticator) IsUnique(secret []byte, remoteAddr string) (bool, error) {
+func (authenticator) IsUnique(ctx auth.AuthContext, secret []byte) (bool, error) {
 	return false, types.ErrUnsupported
 }
 
 // DelRecords adds disabled user ID to a stop list.
-func (authenticator) DelRecords(uid types.Uid) error {
+func (authenticator) DelRecords(tenantID types.TenantID, uid types.Uid) error {
 	return nil
 }
 
@@ -191,13 +198,21 @@ func (authenticator) RestrictedTags() ([]string, error) {
 
 // GetResetParams returns authenticator parameters passed to password reset handler
 // (none for short code).
-func (authenticator) GetResetParams(uid types.Uid) (map[string]any, error) {
+func (authenticator) GetResetParams(tenantID types.TenantID, uid types.Uid) (map[string]any, error) {
 	return nil, nil
 }
 
 // Replace all occurrences of '%' with '/' to ensure SQL LIKE query works correctly.
 func sanitizeKey(key string) string {
 	return strings.ReplaceAll(key, "%", "/")
+}
+
+func cachePrefix(tenantID types.TenantID) string {
+	return realName + "_" + strconv.FormatInt(int64(tenantID), 10) + "_"
+}
+
+func cacheKey(tenantID types.TenantID, credential string) string {
+	return sanitizeKey(cachePrefix(tenantID) + credential)
 }
 
 const realName = "code"

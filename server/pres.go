@@ -67,7 +67,7 @@ func (t *Topic) addToPerSubs(topic string, online, enabled bool) {
 // perSubs contains (a) topics that the user wants to notify of his presence and
 // (b) those which want to receive notifications from this user.
 func (t *Topic) loadContacts(uid types.Uid) error {
-	subs, err := store.Users.GetSubs(uid)
+	subs, err := store.Users.GetSubs(t.tenantID, uid)
 	if err != nil {
 		return err
 	}
@@ -210,6 +210,7 @@ func (t *Topic) procPresReq(fromUserID, what string, wantReply bool) string {
 	// A[online, B:on] to B[online, A:on]: {pres A on} <<-- unnecessary, that's why wantReply is needed
 	if (onlineUpdate || reqReply) && wantReply {
 		globals.hub.routeSrv <- &ServerComMessage{
+			TenantID: t.tenantID,
 			// Topic is 'me' even for group topics; group topics will use 'me' as a signal to drop the message
 			// without forwarding to sessions
 			Pres: &MsgServerPres{
@@ -264,6 +265,7 @@ func (t *Topic) presUsersOfInterest(what, ua string) {
 		}
 
 		globals.hub.routeSrv <- &ServerComMessage{
+			TenantID: t.tenantID,
 			Pres: &MsgServerPres{
 				Topic:     notifyOn,
 				What:      what,
@@ -283,7 +285,7 @@ func (t *Topic) presUsersOfInterest(what, ua string) {
 
 // Publish user's update to his/her users of interest on their 'me' topic while user's 'me' topic is offline
 // Case A: user is being deleted, "gone".
-func presUsersOfInterestOffline(uid types.Uid, subs []types.Subscription, what string) {
+func presUsersOfInterestOffline(tenantID types.TenantID, uid types.Uid, subs []types.Subscription, what string) {
 	// Push update to subscriptions
 	for i := range subs {
 		notifyOn := notifyOnOrSkip(subs[i].Topic, what, true)
@@ -292,6 +294,7 @@ func presUsersOfInterestOffline(uid types.Uid, subs []types.Subscription, what s
 		}
 
 		globals.hub.routeSrv <- &ServerComMessage{
+			TenantID: tenantID,
 			Pres: &MsgServerPres{
 				Topic:     notifyOn,
 				What:      what,
@@ -326,6 +329,7 @@ func (t *Topic) presSubsOnline(what, src string, params *presParams, filter *pre
 	}
 
 	globals.hub.routeSrv <- &ServerComMessage{
+		TenantID: t.tenantID,
 		Pres: &MsgServerPres{
 			Topic:       t.xoriginal,
 			What:        what,
@@ -367,6 +371,7 @@ func (t *Topic) userIsPresencer(uid types.Uid) bool {
 // This is needed because the session(s) may be already disconnected by the time it's routed through topic.
 func (t *Topic) presSubsOnlineDirect(what string, params *presParams, filter *presFilters, skipSid string) {
 	msg := &ServerComMessage{
+		TenantID: t.tenantID,
 		Pres: &MsgServerPres{
 			Topic:  t.xoriginal,
 			What:   what,
@@ -411,7 +416,8 @@ func (t *Topic) presSubsOnlineDirect(what string, params *presParams, filter *pr
 // to a list of topics promting the client to resubscribe to the topics.
 func (s *Session) presTermDirect(subs []string) {
 	msg := &ServerComMessage{
-		Pres: &MsgServerPres{Topic: "me", What: "term"},
+		TenantID: s.tenantID,
+		Pres:     &MsgServerPres{Topic: "me", What: "term"},
 	}
 	for _, topic := range subs {
 		msg.Pres.Src = topic
@@ -453,6 +459,7 @@ func (t *Topic) presSubsOffline(what string, params *presParams,
 		}
 
 		globals.hub.routeSrv <- &ServerComMessage{
+			TenantID: t.tenantID,
 			Pres: &MsgServerPres{
 				Topic:       "me",
 				What:        what,
@@ -486,6 +493,7 @@ func (t *Topic) infoSubsOffline(from types.Uid, what string, seq int, skipSid st
 		}
 
 		globals.hub.routeSrv <- &ServerComMessage{
+			TenantID: t.tenantID,
 			Info: &MsgServerInfo{
 				Topic:     "me",
 				Src:       t.original(uid),
@@ -513,6 +521,7 @@ func (t *Topic) infoCallSubsOffline(from string, target types.Uid, event string,
 		return
 	}
 	msg := &ServerComMessage{
+		TenantID: t.tenantID,
 		Info: &MsgServerInfo{
 			Topic:   "me",
 			Src:     t.original(target),
@@ -532,7 +541,7 @@ func (t *Topic) infoCallSubsOffline(from string, target types.Uid, event string,
 }
 
 // Same as presSubsOffline, but the topic has not been loaded/initialized first: offline topic, offline subscribers
-func presSubsOfflineOffline(topic string, cat types.TopicCat, subs []types.Subscription, what string,
+func presSubsOfflineOffline(tenantID types.TenantID, topic string, cat types.TopicCat, subs []types.Subscription, what string,
 	params *presParams, skipSid string) {
 
 	count := 0
@@ -562,6 +571,7 @@ func presSubsOfflineOffline(topic string, cat types.TopicCat, subs []types.Subsc
 		}
 
 		globals.hub.routeSrv <- &ServerComMessage{
+			TenantID: tenantID,
 			Pres: &MsgServerPres{
 				Topic:     "me",
 				What:      what,
@@ -608,6 +618,7 @@ func (t *Topic) presSingleUserOffline(uid types.Uid, mode types.AccessMode,
 		}
 
 		globals.hub.routeSrv <- &ServerComMessage{
+			TenantID: t.tenantID,
 			Pres: &MsgServerPres{
 				Topic:     "me",
 				What:      what,
@@ -629,7 +640,7 @@ func (t *Topic) presSingleUserOffline(uid types.Uid, mode types.AccessMode,
 
 // Announce to a single user on 'me' topic. The originating topic is not used (not loaded or user
 // already unsubscribed).
-func presSingleUserOfflineOffline(uid types.Uid, original, what string, params *presParams, skipSid string) {
+func presSingleUserOfflineOffline(tenantID types.TenantID, uid types.Uid, original, what string, params *presParams, skipSid string) {
 	user := uid.UserId()
 	actor := params.actor
 	target := params.target
@@ -642,6 +653,7 @@ func presSingleUserOfflineOffline(uid types.Uid, original, what string, params *
 	}
 
 	globals.hub.routeSrv <- &ServerComMessage{
+		TenantID: tenantID,
 		Pres: &MsgServerPres{
 			Topic:     "me",
 			What:      what,

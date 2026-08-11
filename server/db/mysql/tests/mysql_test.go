@@ -22,6 +22,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/jmoiron/sqlx"
+	"github.com/tinode/chat/server/auth"
 	adapter "github.com/tinode/chat/server/db"
 	"github.com/tinode/chat/server/store"
 	jcr "github.com/tinode/jsonco"
@@ -46,6 +47,80 @@ var testData *test_data.TestData
 
 var dummyUid1 = types.Uid(12345)
 var dummyUid2 = types.Uid(54321)
+
+func TestTenantAuthIsolation(t *testing.T) {
+	tenantAdp, ok := adp.(adapter.TenantAuthAdapter)
+	if !ok {
+		t.Fatal("MySQL adapter does not implement TenantAuthAdapter")
+	}
+
+	now := types.TimeNow()
+	suffix := fmt.Sprintf("%d", now.UnixNano())
+	createTenant := func(code string) types.TenantID {
+		res, err := db.Exec("INSERT INTO im_tenant(code,name,state,created_by,updated_by) VALUES(?,?,?,?,?)",
+			code+suffix, code, types.TenantStateActive, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return types.TenantID(id)
+	}
+
+	tenantA := createTenant("test-auth-a-")
+	tenantB := createTenant("test-auth-b-")
+	userAID := now.UnixNano() & 0x3fffffffffffffff
+	userBID := userAID + 1
+	t.Cleanup(func() {
+		db.Exec("DELETE FROM credentials WHERE tenant_id IN (?,?)", tenantA, tenantB)
+		db.Exec("DELETE FROM auth WHERE tenant_id IN (?,?)", tenantA, tenantB)
+		db.Exec("DELETE FROM users WHERE tenant_id IN (?,?)", tenantA, tenantB)
+		db.Exec("DELETE FROM im_tenant WHERE id IN (?,?)", tenantA, tenantB)
+	})
+
+	for tenantID, userID := range map[types.TenantID]int64{tenantA: userAID, tenantB: userBID} {
+		_, err := db.Exec("INSERT INTO users(id,tenant_id,createdat,updatedat,state,access,public,trusted,tags) "+
+			"VALUES(?,?,?,?,?,?,?,?,?)", userID, tenantID, now, now, types.StateOK, `{}`, nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = db.Exec("INSERT INTO auth(tenant_id,uname,userid,scheme,authlvl,secret) VALUES(?,?,?,?,?,?)",
+			tenantID, "basic:alice", userID, "basic", auth.LevelAuth, []byte("hash"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = db.Exec("INSERT INTO credentials(tenant_id,createdat,updatedat,method,value,synthetic,userid,resp,done) "+
+			"VALUES(?,?,?,?,?,?,?,?,?)", tenantID, now, now, "tel", "13800000000", "tel:13800000000",
+			userID, "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	uidA, _, _, _, err := tenantAdp.TenantAuthGetUniqueRecord(tenantA, "basic:alice")
+	if err != nil || uidA != store.EncodeUid(userAID) {
+		t.Fatalf("tenant A auth lookup: uid=%v err=%v", uidA, err)
+	}
+	uidB, _, _, _, err := tenantAdp.TenantAuthGetUniqueRecord(tenantB, "basic:alice")
+	if err != nil || uidB != store.EncodeUid(userBID) {
+		t.Fatalf("tenant B auth lookup: uid=%v err=%v", uidB, err)
+	}
+	credA, err := tenantAdp.TenantUserGetByCred(tenantA, "tel", "13800000000")
+	if err != nil || credA != uidA {
+		t.Fatalf("tenant A credential lookup: uid=%v err=%v", credA, err)
+	}
+	credB, err := tenantAdp.TenantUserGetByCred(tenantB, "tel", "13800000000")
+	if err != nil || credB != uidB {
+		t.Fatalf("tenant B credential lookup: uid=%v err=%v", credB, err)
+	}
+
+	if err = tenantAdp.TenantAuthUpdRecord(tenantA, uidB, "basic", "basic:changed",
+		auth.LevelAuth, nil, time.Time{}); err != types.ErrNotFound {
+		t.Fatalf("cross-tenant auth update: got %v, want %v", err, types.ErrNotFound)
+	}
+}
 
 func TestCreateDb(t *testing.T) {
 	if err := adp.CreateDb(config.Reset); err != nil {

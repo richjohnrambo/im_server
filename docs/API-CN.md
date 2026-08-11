@@ -576,7 +576,8 @@ Tinode 服务器可在反向代理（如 NGINX）后运行：
     "ua": "JS/1.0 (Windows 10)",
     "dev": "L1iC2...dNtk2",
     "platf": "android",
-    "lang": "en-US"
+    "lang": "en-US",
+    "tenant": "acme"
   }
 }
 ```
@@ -585,12 +586,13 @@ Tinode 服务器可在反向代理（如 NGINX）后运行：
 |------|------|------|
 | `id` | 否 | 客户端消息 ID |
 | `ver` | 是 | 支持的协议版本 |
+| `tenant` | 是 | 企业码；首次握手时解析并固定当前 Session 的租户 |
 | `ua` | 否 | 用户代理字符串 |
 | `dev` | 否 | 设备唯一标识（用于推送） |
 | `platf` | 否 | 平台：android/ios/web |
 | `lang` | 否 | 客户端语言 |
 
-服务器响应 `{ctrl}`，包含 `build`、`ver`、`sid` 等参数。
+服务器响应 `{ctrl}`，包含 `build`、`ver`、`sid` 以及公开租户信息等参数。租户绑定后不能在当前 Session 中切换。
 
 ---
 

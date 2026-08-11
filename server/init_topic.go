@@ -63,7 +63,7 @@ func topicInit(t *Topic, join *ClientComMessage, h *Hub) {
 	// Failed to create or load the topic.
 	if err != nil {
 		// Remove topic from cache to prevent hub from forwarding more messages to it.
-		h.topicDel(join.RcptTo)
+		h.topicDel(types.TopicKey{TenantID: join.TenantID, Topic: join.RcptTo})
 
 		logs.Err.Println("init_topic: failed to load or create topic:", join.RcptTo, err)
 		join.sess.queueOut(decodeStoreErrorExplicitTs(err, join.Id, t.xoriginal, timestamp, join.Timestamp, nil))
@@ -107,7 +107,7 @@ func topicInit(t *Topic, join *ClientComMessage, h *Hub) {
 
 	// prevent newly initialized topics to go live while shutdown in progress
 	if globals.shuttingDown {
-		h.topicDel(join.RcptTo)
+		h.topicDel(types.TopicKey{TenantID: join.TenantID, Topic: join.RcptTo})
 		return
 	}
 
@@ -138,7 +138,7 @@ func topicInit(t *Topic, join *ClientComMessage, h *Hub) {
 func initTopicMe(t *Topic, sreg *ClientComMessage) error {
 	t.cat = types.TopicCatMe
 
-	user, err := store.Users.Get(types.ParseUserId(t.name))
+	user, err := store.Users.Get(t.tenantID, types.ParseUserId(t.name))
 	if err != nil {
 		// Log out the session
 		sreg.sess.uid = types.ZeroUid
@@ -193,7 +193,7 @@ func initTopicFnd(t *Topic, sreg *ClientComMessage) error {
 		return types.ErrNotFound
 	}
 
-	user, err := store.Users.Get(uid)
+	user, err := store.Users.Get(t.tenantID, uid)
 	if err != nil {
 		return err
 	} else if user == nil {
@@ -238,7 +238,7 @@ func initTopicP2P(t *Topic, sreg *ClientComMessage) error {
 	t.cat = types.TopicCatP2P
 
 	// Check if the topic already exists
-	stopic, err := store.Topics.Get(t.name)
+	stopic, err := store.Topics.Get(t.tenantID, t.name)
 	if err != nil {
 		return err
 	}
@@ -247,7 +247,7 @@ func initTopicP2P(t *Topic, sreg *ClientComMessage) error {
 	var subs []types.Subscription
 	if stopic != nil {
 		// Subs already have Public swapped
-		if subs, err = store.Topics.GetUsers(t.name, nil); err != nil {
+		if subs, err = store.Topics.GetUsers(t.tenantID, t.name, nil); err != nil {
 			return err
 		}
 
@@ -309,7 +309,7 @@ func initTopicP2P(t *Topic, sreg *ClientComMessage) error {
 
 		// User index: u1 - requester, u2 - responder, the other user
 		var u1, u2 int
-		users, err := store.Users.GetAll(userID1, userID2)
+		users, err := store.Users.GetAll(t.tenantID, userID1, userID2)
 		if err != nil {
 			return err
 		}
@@ -343,9 +343,10 @@ func initTopicP2P(t *Topic, sreg *ClientComMessage) error {
 		// Other user's (responder's) subscription is missing
 		if sub2 == nil {
 			sub2 = &types.Subscription{
-				User:    userID2.String(),
-				Topic:   t.name,
-				Private: nil,
+				TenantID: t.tenantID,
+				User:     userID2.String(),
+				Topic:    t.name,
+				Private:  nil,
 			}
 
 			// Assign user2's ModeGiven based on what user1 has provided.
@@ -418,6 +419,7 @@ func initTopicP2P(t *Topic, sreg *ClientComMessage) error {
 			}
 
 			sub1 = &types.Subscription{
+				TenantID:  t.tenantID,
 				User:      userID1.String(),
 				Topic:     t.name,
 				ModeWant:  userData.modeWant,
@@ -444,7 +446,7 @@ func initTopicP2P(t *Topic, sreg *ClientComMessage) error {
 
 		// Create everything
 		if stopic == nil {
-			if err = store.Topics.CreateP2P(sub1, sub2); err != nil {
+			if err = store.Topics.CreateP2P(t.tenantID, sub1, sub2); err != nil {
 				return err
 			}
 
@@ -464,7 +466,7 @@ func initTopicP2P(t *Topic, sreg *ClientComMessage) error {
 			} else {
 				subToMake = sub2
 			}
-			if err = store.Subs.Create(subToMake); err != nil {
+			if err = store.Subs.Create(t.tenantID, subToMake); err != nil {
 				return err
 			}
 		}
@@ -592,6 +594,7 @@ func initTopicNewGrp(t *Topic, sreg *ClientComMessage, isChan bool) error {
 
 	stopic := &types.Topic{
 		ObjHeader: types.ObjHeader{Id: sreg.RcptTo, CreatedAt: timestamp},
+		TenantID:  t.tenantID,
 		Access:    types.DefaultAccess{Auth: t.accessAuth, Anon: t.accessAnon},
 		Tags:      t.tags,
 		UseBt:     isChan,
@@ -601,14 +604,14 @@ func initTopicNewGrp(t *Topic, sreg *ClientComMessage, isChan bool) error {
 
 	// store.Topics.Create will add a subscription record for the topic creator
 	stopic.GiveAccess(t.owner, userData.modeWant, userData.modeGiven)
-	err := store.Topics.Create(stopic, t.owner, t.perUser[t.owner].private)
+	err := store.Topics.Create(t.tenantID, stopic, t.owner, t.perUser[t.owner].private)
 	if err != nil {
 		return err
 	}
 
 	// Link uploaded avatar to topic.
 	if sreg.Extra != nil && len(sreg.Extra.Attachments) > 0 {
-		if err := store.Files.LinkAttachments(t.name, types.ZeroUid, sreg.Extra.Attachments); err != nil {
+		if err := store.Files.LinkAttachments(t.tenantID, t.name, types.ZeroUid, sreg.Extra.Attachments); err != nil {
 			logs.Warn.Printf("topic[%s] failed to link avatar attachment: %v", t.name, err)
 			// This is not a critical error, continue execution.
 		}
@@ -629,7 +632,7 @@ func initTopicGrp(t *Topic) error {
 	t.cat = types.TopicCatGrp
 
 	// TODO(gene): check and validate topic name
-	stopic, err := store.Topics.Get(t.name)
+	stopic, err := store.Topics.Get(t.tenantID, t.name)
 	if err != nil {
 		return err
 	} else if stopic == nil {
@@ -675,7 +678,7 @@ func initTopicGrp(t *Topic) error {
 func initTopicSys(t *Topic) error {
 	t.cat = types.TopicCatSys
 
-	stopic, err := store.Topics.Get(t.name)
+	stopic, err := store.Topics.Get(t.tenantID, t.name)
 	if err != nil {
 		return err
 	} else if stopic == nil {
@@ -709,7 +712,7 @@ func initTopicSys(t *Topic) error {
 func initTopicSlf(t *Topic, sreg *ClientComMessage) error {
 	t.cat = types.TopicCatSlf
 
-	stopic, err := store.Topics.Get(t.name)
+	stopic, err := store.Topics.Get(t.tenantID, t.name)
 	if err != nil {
 		return err
 	}
@@ -740,7 +743,7 @@ func initTopicSlf(t *Topic, sreg *ClientComMessage) error {
 	} else {
 		// Get topic owner.
 		userID := types.ParseUserId(sreg.AsUser)
-		user, err := store.Users.Get(userID)
+		user, err := store.Users.Get(t.tenantID, userID)
 		if err != nil {
 			return err
 		}
@@ -795,13 +798,14 @@ func initTopicSlf(t *Topic, sreg *ClientComMessage) error {
 
 		stopic = &types.Topic{
 			ObjHeader: types.ObjHeader{Id: sreg.RcptTo, CreatedAt: timestamp},
+			TenantID:  t.tenantID,
 			Access:    types.DefaultAccess{Auth: t.accessAuth, Anon: t.accessAnon},
 			Tags:      t.tags,
 		}
 
 		// store.Topics.Create will add a subscription record for the topic creator
 		stopic.GiveAccess(t.owner, userData.modeWant, userData.modeGiven)
-		err = store.Topics.Create(stopic, t.owner, t.perUser[t.owner].private)
+		err = store.Topics.Create(t.tenantID, stopic, t.owner, t.perUser[t.owner].private)
 		if err != nil {
 			return err
 		}
@@ -815,7 +819,7 @@ func initTopicSlf(t *Topic, sreg *ClientComMessage) error {
 
 // loadSubscribers loads topic subscribers, sets topic owner.
 func (t *Topic) loadSubscribers() error {
-	subs, err := store.Topics.GetSubs(t.name, nil)
+	subs, err := store.Topics.GetSubs(t.tenantID, t.name, nil)
 	if err != nil {
 		return err
 	}

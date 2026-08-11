@@ -103,6 +103,9 @@ type Session struct {
 	// ID of the current user. Could be zero if session is not authenticated
 	// or for multiplexing sessions.
 	uid types.Uid
+	// Tenant context is resolved from the first hi packet and cannot change.
+	tenantID   types.TenantID
+	tenantCode string
 
 	// Authentication level - NONE (unset), ANON, AUTH, ROOT.
 	authLvl auth.Level
@@ -276,6 +279,17 @@ func (s *Session) queueOutBatch(msgs []*ServerComMessage) bool {
 	if atomic.LoadInt32(&s.terminating) > 0 {
 		return true
 	}
+	for _, msg := range msgs {
+		if msg == nil {
+			continue
+		}
+		if msg.TenantID.IsZero() {
+			msg.TenantID = s.tenantID
+		} else if !s.tenantID.IsZero() && msg.TenantID != s.tenantID {
+			logs.Err.Printf("s.queueOutBatch: rejected cross-tenant message: session=%d message=%d", s.tenantID, msg.TenantID)
+			return false
+		}
+	}
 
 	if s.multi != nil {
 		// In case of a cluster we need to pass a copy of the actual session.
@@ -317,6 +331,15 @@ func (s *Session) queueOut(msg *ServerComMessage) bool {
 	}
 	if atomic.LoadInt32(&s.terminating) > 0 {
 		return true
+	}
+	if msg == nil {
+		return true
+	}
+	if msg.TenantID.IsZero() {
+		msg.TenantID = s.tenantID
+	} else if !s.tenantID.IsZero() && msg.TenantID != s.tenantID {
+		logs.Err.Printf("s.queueOut: rejected cross-tenant message: session=%d message=%d", s.tenantID, msg.TenantID)
+		return false
 	}
 
 	if s.multi != nil {
@@ -497,6 +520,12 @@ func (s *Session) dispatch(msg *ClientComMessage) {
 		logs.Warn.Println("s.dispatch: malformed asUser: ", msg.Extra.AsUser, s.sid)
 		return
 	} else {
+		state, err := userGetState(s.tenantID, fromUid)
+		if err != nil || state != types.StateOK {
+			s.queueOut(ErrPermissionDenied("", "", now))
+			logs.Warn.Println("s.dispatch: cross-tenant or inactive asUser", s.sid)
+			return
+		}
 		// Use provided msg.Extra.AsUser
 		msg.AsUser = msg.Extra.AsUser
 
@@ -526,6 +555,18 @@ func (s *Session) dispatch(msg *ClientComMessage) {
 		}
 	}
 
+	// Check if the session has an immutable tenant context.
+	checkTenant := func(handler func(*ClientComMessage)) func(*ClientComMessage) {
+		return func(m *ClientComMessage) {
+			if s.tenantID.IsZero() {
+				logs.Warn.Println("s.dispatch: tenant context is missing", s.sid)
+				s.queueOut(ErrCommandOutOfSequence(m.Id, m.Original, msg.Timestamp))
+				return
+			}
+			handler(m)
+		}
+	}
+
 	// Check if user is logged in
 	checkUser := func(handler func(*ClientComMessage)) func(*ClientComMessage) {
 		return func(m *ClientComMessage) {
@@ -540,19 +581,19 @@ func (s *Session) dispatch(msg *ClientComMessage) {
 
 	switch {
 	case msg.Pub != nil:
-		handler = checkVers(checkUser(s.publish))
+		handler = checkVers(checkTenant(checkUser(s.publish)))
 		msg.Id = msg.Pub.Id
 		msg.Original = msg.Pub.Topic
 		uaRefresh = true
 
 	case msg.Sub != nil:
-		handler = checkVers(checkUser(s.subscribe))
+		handler = checkVers(checkTenant(checkUser(s.subscribe)))
 		msg.Id = msg.Sub.Id
 		msg.Original = msg.Sub.Topic
 		uaRefresh = true
 
 	case msg.Leave != nil:
-		handler = checkVers(checkUser(s.leave))
+		handler = checkVers(checkTenant(checkUser(s.leave)))
 		msg.Id = msg.Leave.Id
 		msg.Original = msg.Leave.Topic
 
@@ -561,28 +602,28 @@ func (s *Session) dispatch(msg *ClientComMessage) {
 		msg.Id = msg.Hi.Id
 
 	case msg.Login != nil:
-		handler = checkVers(s.login)
+		handler = checkVers(checkTenant(s.login))
 		msg.Id = msg.Login.Id
 
 	case msg.Get != nil:
-		handler = checkVers(checkUser(s.get))
+		handler = checkVers(checkTenant(checkUser(s.get)))
 		msg.Id = msg.Get.Id
 		msg.Original = msg.Get.Topic
 		uaRefresh = true
 
 	case msg.Set != nil:
-		handler = checkVers(checkUser(s.set))
+		handler = checkVers(checkTenant(checkUser(s.set)))
 		msg.Id = msg.Set.Id
 		msg.Original = msg.Set.Topic
 		uaRefresh = true
 
 	case msg.Del != nil:
-		handler = checkVers(checkUser(s.del))
+		handler = checkVers(checkTenant(checkUser(s.del)))
 		msg.Id = msg.Del.Id
 		msg.Original = msg.Del.Topic
 
 	case msg.Acc != nil:
-		handler = checkVers(s.acc)
+		handler = checkVers(checkTenant(s.acc))
 		msg.Id = msg.Acc.Id
 
 	case msg.Note != nil:
@@ -607,6 +648,7 @@ func (s *Session) dispatch(msg *ClientComMessage) {
 
 	msg.sess = s
 	msg.init = true
+	msg.TenantID = s.tenantID
 	handler(msg)
 
 	// Notify 'me' topic that this session is currently active.
@@ -623,7 +665,7 @@ func (s *Session) subscribe(msg *ClientComMessage) {
 	if strings.HasPrefix(msg.Original, "new") || strings.HasPrefix(msg.Original, "nch") {
 		// Request to create a new group/channel topic.
 		// If we are in a cluster, make sure the new topic belongs to the current node.
-		msg.RcptTo = globals.cluster.genLocalTopicName()
+		msg.RcptTo = globals.cluster.genLocalTopicName(msg.TenantID)
 	} else {
 		var resp *ServerComMessage
 		msg.RcptTo, resp = s.expandTopicName(msg)
@@ -741,19 +783,50 @@ func (s *Session) hello(msg *ClientComMessage) {
 	var deviceIDUpdate bool
 
 	if s.ver == 0 {
-		s.ver = parseVersion(msg.Hi.Version)
-		if s.ver == 0 {
+		clientVersion := parseVersion(msg.Hi.Version)
+		if clientVersion == 0 {
 			logs.Warn.Println("s.hello:", "failed to parse version", s.sid)
 			s.queueOut(ErrMalformed(msg.Id, "", msg.Timestamp))
 			return
 		}
 		// Check version compatibility
-		if versionCompare(s.ver, minSupportedVersionValue) < 0 {
-			s.ver = 0
+		if versionCompare(clientVersion, minSupportedVersionValue) < 0 {
 			s.queueOut(ErrVersionNotSupported(msg.Id, msg.Timestamp))
 			logs.Warn.Println("s.hello:", "unsupported version", s.sid)
 			return
 		}
+
+		tenantCode := strings.TrimSpace(msg.Hi.Tenant)
+		if tenantCode == "" || len(tenantCode) > 64 {
+			s.queueOut(ErrMalformed(msg.Id, "", msg.Timestamp))
+			logs.Warn.Println("s.hello: tenant code is missing or invalid", s.sid)
+			return
+		}
+		if store.Tenants == nil {
+			s.queueOut(ErrUnknown(msg.Id, "", msg.Timestamp))
+			logs.Err.Println("s.hello: tenant store is not initialized", s.sid)
+			return
+		}
+		tenant, err := store.Tenants.GetByCode(tenantCode)
+		if err != nil {
+			s.queueOut(decodeStoreError(err, msg.Id, msg.Timestamp, nil))
+			logs.Warn.Println("s.hello: failed to resolve tenant", tenantCode, err, s.sid)
+			return
+		}
+		if tenant == nil || tenant.ID.IsZero() {
+			s.queueOut(ErrUnknown(msg.Id, "", msg.Timestamp))
+			logs.Err.Println("s.hello: tenant store returned an invalid record", tenantCode, s.sid)
+			return
+		}
+		if !tenant.IsActive() {
+			s.queueOut(ErrPermissionDenied(msg.Id, "", msg.Timestamp))
+			logs.Warn.Println("s.hello: tenant is not active", tenant.Code, s.sid)
+			return
+		}
+
+		s.ver = clientVersion
+		s.tenantID = tenant.ID
+		s.tenantCode = tenant.Code
 
 		params = map[string]any{
 			"ver":                currentVersion,
@@ -766,6 +839,10 @@ func (s *Session) hello(msg *ClientComMessage) {
 			"maxFileUploadSize":  globals.maxFileUploadSize,
 			"reqCred":            globals.validatorClientConfig,
 			"msgDelAge":          globals.msgDeleteAge.Seconds(),
+			"tenant": map[string]any{
+				"code": tenant.Code,
+				"name": tenant.Name,
+			},
 		}
 		if len(globals.iceServers) > 0 {
 			params["iceServers"] = globals.iceServers
@@ -798,6 +875,11 @@ func (s *Session) hello(msg *ClientComMessage) {
 			s.bkgTimer.Reset(deferredNotificationsTimeout)
 		}
 	} else if msg.Hi.Version == "" || parseVersion(msg.Hi.Version) == s.ver {
+		if tenantCode := strings.TrimSpace(msg.Hi.Tenant); tenantCode != "" && tenantCode != s.tenantCode {
+			s.queueOut(ErrCommandOutOfSequence(msg.Id, "", msg.Timestamp))
+			logs.Warn.Println("s.hello: tenant cannot be changed", s.sid)
+			return
+		}
 		// Save changed device ID+Lang or delete earlier specified device ID.
 		// Platform cannot be changed.
 		if !s.uid.IsZero() {
@@ -806,18 +888,19 @@ func (s *Session) hello(msg *ClientComMessage) {
 				// User wants to delete device ID.
 				deviceIDUpdate = true
 				if s.deviceID != "" {
-					err = store.Devices.Delete(s.uid, s.deviceID)
+					err = store.Devices.Delete(s.tenantID, s.uid, s.deviceID)
 				}
 			} else if msg.Hi.DeviceID != "" && s.deviceID != msg.Hi.DeviceID {
 				deviceIDUpdate = true
-				err = store.Devices.Update(s.uid, s.deviceID, &types.DeviceDef{
+				err = store.Devices.Update(s.tenantID, s.uid, s.deviceID, &types.DeviceDef{
+					TenantID: s.tenantID,
 					DeviceId: msg.Hi.DeviceID,
 					Platform: s.platf,
 					LastSeen: msg.Timestamp,
 					Lang:     msg.Hi.Lang,
 				})
 
-				userChannelsSubUnsub(s.uid, msg.Hi.DeviceID, true)
+				userChannelsSubUnsub(s.tenantID, s.uid, msg.Hi.DeviceID, true)
 			}
 
 			if err != nil {
@@ -903,11 +986,18 @@ func (s *Session) acc(msg *ClientComMessage) {
 		}
 
 		var err error
-		rec, _, err = authHdl.Authenticate(msg.Acc.TmpSecret, s.remoteAddr)
+		rec, _, err = authHdl.Authenticate(auth.AuthContext{TenantID: s.tenantID, RemoteAddr: s.remoteAddr},
+			msg.Acc.TmpSecret)
 		if err != nil {
 			s.queueOut(decodeStoreError(err, msg.Acc.Id, msg.Timestamp,
 				map[string]any{"what": "auth"}))
 			logs.Warn.Println("s.acc: invalid temp auth", err, s.sid)
+			return
+		}
+		if rec == nil || rec.TenantID != s.tenantID {
+			s.queueOut(decodeStoreError(types.ErrFailed, msg.Acc.Id, msg.Timestamp,
+				map[string]any{"what": "auth"}))
+			logs.Warn.Println("s.acc: temp auth returned invalid tenant", s.sid)
 			return
 		}
 	}
@@ -948,7 +1038,8 @@ func (s *Session) login(msg *ClientComMessage) {
 		return
 	}
 
-	rec, challenge, err := handler.Authenticate(msg.Login.Secret, s.remoteAddr)
+	rec, challenge, err := handler.Authenticate(
+		auth.AuthContext{TenantID: s.tenantID, RemoteAddr: s.remoteAddr}, msg.Login.Secret)
 	if err != nil {
 		resp := decodeStoreError(err, msg.Id, msg.Timestamp, nil)
 		if resp.Ctrl.Code >= 500 {
@@ -959,9 +1050,15 @@ func (s *Session) login(msg *ClientComMessage) {
 		return
 	}
 
+	if rec == nil || rec.TenantID != s.tenantID {
+		logs.Warn.Println("s.login: authenticator returned invalid tenant", s.sid)
+		s.queueOut(decodeStoreError(types.ErrFailed, msg.Id, msg.Timestamp, nil))
+		return
+	}
+
 	// If authenticator did not check user state, it returns state "undef". If so, check user state here.
 	if rec.State == types.StateUndefined {
-		rec.State, err = userGetState(rec.Uid)
+		rec.State, err = userGetState(s.tenantID, rec.Uid)
 	}
 	if err == nil && rec.State != types.StateOK {
 		err = types.ErrPermissionDenied
@@ -983,7 +1080,7 @@ func (s *Session) login(msg *ClientComMessage) {
 	if rec.Features&auth.FeatureValidated == 0 && len(globals.authValidators[rec.AuthLevel]) > 0 {
 		var validated []string
 		// Check responses. Ignore invalid responses, just keep cred unvalidated.
-		if validated, _, err = validatedCreds(rec.Uid, rec.AuthLevel, msg.Login.Cred, false); err == nil {
+		if validated, _, err = validatedCreds(s.tenantID, rec.Uid, rec.AuthLevel, msg.Login.Cred, false); err == nil {
 			// Get a list of credentials which have not been validated.
 			_, missing, _ = stringSliceDelta(globals.authValidators[rec.AuthLevel], validated)
 		}
@@ -1017,7 +1114,7 @@ func (s *Session) authSecretReset(params []byte) error {
 	if validator == nil {
 		return types.ErrUnsupported
 	}
-	uid, err := store.Users.GetByCred(credMethod, credValue)
+	uid, err := store.Users.GetByCred(s.tenantID, credMethod, credValue)
 	if err != nil {
 		return err
 	}
@@ -1026,7 +1123,7 @@ func (s *Session) authSecretReset(params []byte) error {
 		return nil
 	}
 
-	resetParams, err := auther.GetResetParams(uid)
+	resetParams, err := auther.GetResetParams(s.tenantID, uid)
 	if err != nil {
 		return err
 	}
@@ -1042,6 +1139,7 @@ func (s *Session) authSecretReset(params []byte) error {
 	}
 
 	code, _, err := tempAuth.GenSecret(&auth.Rec{
+		TenantID:   s.tenantID,
 		Uid:        uid,
 		AuthLevel:  auth.LevelAuth,
 		Features:   auth.FeatureNoLogin,
@@ -1051,7 +1149,7 @@ func (s *Session) authSecretReset(params []byte) error {
 		return err
 	}
 
-	return validator.ResetSecret(credValue, authScheme, s.lang, code, resetParams)
+	return validator.ResetSecret(s.tenantID, credValue, authScheme, s.lang, code, resetParams)
 }
 
 // onLogin performs steps after successful authentication.
@@ -1087,7 +1185,8 @@ func (s *Session) onLogin(msgID string, timestamp time.Time, rec *auth.Rec, miss
 
 		// Record deviceId used in this session
 		if s.deviceID != "" {
-			if err := store.Devices.Update(rec.Uid, "", &types.DeviceDef{
+			if err := store.Devices.Update(s.tenantID, rec.Uid, "", &types.DeviceDef{
+				TenantID: s.tenantID,
 				DeviceId: s.deviceID,
 				Platform: s.platf,
 				LastSeen: timestamp,
@@ -1226,10 +1325,11 @@ func (s *Session) del(msg *ClientComMessage) {
 		// Hub will forward to topic, if appropriate.
 		select {
 		case globals.hub.unreg <- &topicUnreg{
-			rcptTo: msg.RcptTo,
-			pkt:    msg,
-			sess:   s,
-			del:    true,
+			tenantID: s.tenantID,
+			rcptTo:   msg.RcptTo,
+			pkt:      msg,
+			sess:     s,
+			del:      true,
 		}:
 		default:
 			// Reply with a 503 to the user.

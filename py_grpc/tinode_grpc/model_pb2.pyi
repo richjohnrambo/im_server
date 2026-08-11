@@ -188,7 +188,7 @@ class SetQuery(_message.Message):
     def __init__(self, desc: _Optional[_Union[SetDesc, _Mapping]] = ..., sub: _Optional[_Union[SetSub, _Mapping]] = ..., tags: _Optional[_Iterable[str]] = ..., cred: _Optional[_Union[ClientCred, _Mapping]] = ..., aux: _Optional[_Mapping[str, bytes]] = ...) -> None: ...
 
 class ClientHi(_message.Message):
-    __slots__ = ["id", "user_agent", "ver", "device_id", "lang", "platform", "background"]
+    __slots__ = ["id", "user_agent", "ver", "device_id", "lang", "platform", "background", "tenant"]
     ID_FIELD_NUMBER: _ClassVar[int]
     USER_AGENT_FIELD_NUMBER: _ClassVar[int]
     VER_FIELD_NUMBER: _ClassVar[int]
@@ -196,6 +196,7 @@ class ClientHi(_message.Message):
     LANG_FIELD_NUMBER: _ClassVar[int]
     PLATFORM_FIELD_NUMBER: _ClassVar[int]
     BACKGROUND_FIELD_NUMBER: _ClassVar[int]
+    TENANT_FIELD_NUMBER: _ClassVar[int]
     id: str
     user_agent: str
     ver: str
@@ -203,7 +204,8 @@ class ClientHi(_message.Message):
     lang: str
     platform: str
     background: bool
-    def __init__(self, id: _Optional[str] = ..., user_agent: _Optional[str] = ..., ver: _Optional[str] = ..., device_id: _Optional[str] = ..., lang: _Optional[str] = ..., platform: _Optional[str] = ..., background: bool = ...) -> None: ...
+    tenant: str
+    def __init__(self, id: _Optional[str] = ..., user_agent: _Optional[str] = ..., ver: _Optional[str] = ..., device_id: _Optional[str] = ..., lang: _Optional[str] = ..., platform: _Optional[str] = ..., background: bool = ..., tenant: _Optional[str] = ...) -> None: ...
 
 class ClientAcc(_message.Message):
     __slots__ = ["id", "user_id", "scheme", "secret", "login", "tags", "desc", "cred", "token", "state", "auth_level", "tmp_scheme", "tmp_secret"]

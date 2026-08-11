@@ -123,7 +123,7 @@ func PrepareV1Notifications(rcpt *push.Receipt, config *configType) ([]*fcmv1.Me
 				skipDevices[deviceID] = struct{}{}
 			}
 		}
-		devices, count, err = store.Devices.GetAll(uids...)
+		devices, count, err = store.Devices.GetAll(rcpt.TenantID, uids...)
 		if err != nil {
 			logs.Warn.Println("fcm push: db error", err)
 			return nil, nil
@@ -187,9 +187,9 @@ func PrepareV1Notifications(rcpt *push.Receipt, config *configType) ([]*fcmv1.Me
 	}
 
 	if rcpt.Channel != "" {
-		topic := rcpt.Channel
+		topic := TenantChannelName(rcpt.TenantID, rcpt.Channel)
 		userData := clonePayload(data)
-		userData["topic"] = topic
+		userData["topic"] = rcpt.Channel
 		// Channel receiver should not know the ID of the message sender.
 		delete(userData, "xfrom")
 		msg := fcmv1.Message{
@@ -209,9 +209,16 @@ func PrepareV1Notifications(rcpt *push.Receipt, config *configType) ([]*fcmv1.Me
 	return messages, uids
 }
 
+func TenantChannelName(tenantID t.TenantID, channel string) string {
+	if !tenantID.IsValid() || channel == "" {
+		return channel
+	}
+	return "tenant-" + strconv.FormatInt(int64(tenantID), 10) + "-" + channel
+}
+
 // DevicesForUser loads device IDs of the given user.
-func DevicesForUser(uid t.Uid) []string {
-	ddef, count, err := store.Devices.GetAll(uid)
+func DevicesForUser(tenantID t.TenantID, uid t.Uid) []string {
+	ddef, count, err := store.Devices.GetAll(tenantID, uid)
 	if err != nil {
 		logs.Warn.Println("fcm devices for user: db error", err)
 		return nil
@@ -229,8 +236,8 @@ func DevicesForUser(uid t.Uid) []string {
 }
 
 // ChannelsForUser loads user's channel subscriptions with P permission.
-func ChannelsForUser(uid t.Uid) []string {
-	channels, err := store.Users.GetChannels(uid)
+func ChannelsForUser(tenantID t.TenantID, uid t.Uid) []string {
+	channels, err := store.Users.GetChannels(tenantID, uid)
 	if err != nil {
 		logs.Warn.Println("fcm channels for user: db error", err)
 		return nil

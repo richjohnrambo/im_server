@@ -258,7 +258,7 @@ func sendPushes(rcpt *push.Receipt, config *configType) {
 			break
 		}
 		// Check for expired tokens and other errors.
-		handlePushResponse(resp, messages[i:upper], uids[i:upper])
+		handlePushResponse(rcpt.TenantID, resp, messages[i:upper], uids[i:upper])
 	}
 }
 
@@ -268,10 +268,10 @@ func processSubscription(req *push.ChannelReq, config *configType) {
 	}
 
 	if req.Channel != "" {
-		su.Devices = fcm.DevicesForUser(req.Uid)
+		su.Devices = fcm.DevicesForUser(req.TenantID, req.Uid)
 		su.Channel = req.Channel
 	} else if req.DeviceID != "" {
-		su.Channels = fcm.ChannelsForUser(req.Uid)
+		su.Channels = fcm.ChannelsForUser(req.TenantID, req.Uid)
 		su.Device = req.DeviceID
 	}
 
@@ -302,7 +302,7 @@ func processSubscription(req *push.ChannelReq, config *configType) {
 	handleSubResponse(resp, req, su.Devices, su.Channels)
 }
 
-func handlePushResponse(batch *batchResponse, messages []*fcmv1.Message, uids []types.Uid) {
+func handlePushResponse(tenantID types.TenantID, batch *batchResponse, messages []*fcmv1.Message, uids []types.Uid) {
 	if batch.FailureCount <= 0 {
 		return
 	}
@@ -318,7 +318,7 @@ func handlePushResponse(batch *batchResponse, messages []*fcmv1.Message, uids []
 			// Usually an invalid token.
 			logs.Warn.Println("tnpg invalid argument:", resp.ExtendedError, resp.ErrorMessage)
 			if strings.Contains(resp.ExtendedError, "message.token") {
-				if err := store.Devices.Delete(uids[i], messages[i].Token); err != nil {
+				if err := store.Devices.Delete(tenantID, uids[i], messages[i].Token); err != nil {
 					logs.Warn.Println("tnpg failed to delete invalid token:", err)
 				}
 			}
@@ -329,7 +329,7 @@ func handlePushResponse(batch *batchResponse, messages []*fcmv1.Message, uids []
 		case common.ErrorUnregistered:
 			// Token is no longer valid.
 			logs.Info.Println("tnpg invalid token:", resp.ErrorMessage, resp.ExtendedError, resp.MessageID)
-			if err := store.Devices.Delete(uids[i], messages[i].Token); err != nil {
+			if err := store.Devices.Delete(tenantID, uids[i], messages[i].Token); err != nil {
 				logs.Warn.Println("tnpg failed to delete invalid token:", err)
 			}
 		default:

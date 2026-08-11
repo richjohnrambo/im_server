@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/tinode/chat/server/logs"
 	"github.com/tinode/chat/server/store/types"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 const (
@@ -350,6 +352,20 @@ func pluginGenerateClientReq(sess *Session, msg *ClientComMessage) *pbx.ClientRe
 	}
 }
 
+func pluginContext(base context.Context, p *Plugin, tenantID types.TenantID) (context.Context, context.CancelFunc) {
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if p.timeout > 0 {
+		ctx, cancel = context.WithTimeout(base, p.timeout)
+	} else {
+		ctx = base
+	}
+	if tenantID.IsValid() {
+		ctx = metadata.AppendToOutgoingContext(ctx, "tenant-id", strconv.FormatInt(int64(tenantID), 10))
+	}
+	return ctx, cancel
+}
+
 func pluginFireHose(sess *Session, msg *ClientComMessage) (*ClientComMessage, *ServerComMessage) {
 	if globals.plugins == nil {
 		// Return the original message to continue processing without changes
@@ -376,13 +392,9 @@ func pluginFireHose(sess *Session, msg *ClientComMessage) (*ClientComMessage, *S
 			}
 		}
 
-		var ctx context.Context
-		var cancel context.CancelFunc
-		if p.timeout > 0 {
-			ctx, cancel = context.WithTimeout(context.Background(), p.timeout)
+		ctx, cancel := pluginContext(context.Background(), p, msg.TenantID)
+		if cancel != nil {
 			defer cancel()
-		} else {
-			ctx = context.Background()
 		}
 		if resp, err := p.client.FireHose(ctx, req); err == nil {
 			respStatus := resp.GetStatus()
@@ -396,16 +408,25 @@ func pluginFireHose(sess *Session, msg *ClientComMessage) (*ClientComMessage, *S
 			}
 			// REPLACE: ClientMsg was updated by the plugin. Use the new one for further processing.
 			if respStatus == pbx.RespCode_REPLACE {
-				return pbCliDeserialize(resp.GetClmsg()), nil
+				repl := pbCliDeserialize(resp.GetClmsg())
+				if repl != nil {
+					repl.TenantID = msg.TenantID
+				}
+				return repl, nil
 			}
 
 			// RESPOND: Plugin provided an alternative response message. Use it
-			return nil, pbServDeserialize(resp.GetSrvmsg())
+			srv := pbServDeserialize(resp.GetSrvmsg())
+			if srv != nil {
+				srv.TenantID = msg.TenantID
+			}
+			return nil, srv
 
 		} else if p.failureCode != 0 {
 			// Plugin failed and it's configured to stop further processing.
 			logs.Err.Println("plugin: failed,", p.name, err)
 			return nil, &ServerComMessage{
+				TenantID: msg.TenantID,
 				Ctrl: &MsgServerCtrl{
 					Id:        id,
 					Code:      p.failureCode,
@@ -424,7 +445,7 @@ func pluginFireHose(sess *Session, msg *ClientComMessage) (*ClientComMessage, *S
 }
 
 // Ask plugin to perform search.
-func pluginFind(user types.Uid, query string) (string, []types.Subscription, error) {
+func pluginFind(tenantID types.TenantID, user types.Uid, query string) (string, []types.Subscription, error) {
 	if globals.plugins == nil {
 		return query, nil, nil
 	}
@@ -440,13 +461,9 @@ func pluginFind(user types.Uid, query string) (string, []types.Subscription, err
 			continue
 		}
 
-		var ctx context.Context
-		var cancel context.CancelFunc
-		if p.timeout > 0 {
-			ctx, cancel = context.WithTimeout(context.Background(), p.timeout)
+		ctx, cancel := pluginContext(context.Background(), p, tenantID)
+		if cancel != nil {
 			defer cancel()
-		} else {
-			ctx = context.Background()
 		}
 		resp, err := p.client.Find(ctx, find)
 		if err != nil {
@@ -499,13 +516,9 @@ func pluginAccount(user *types.User, action int) {
 			}
 		}
 
-		var ctx context.Context
-		var cancel context.CancelFunc
-		if p.timeout > 0 {
-			ctx, cancel = context.WithTimeout(context.Background(), p.timeout)
+		ctx, cancel := pluginContext(context.Background(), p, user.TenantID)
+		if cancel != nil {
 			defer cancel()
-		} else {
-			ctx = context.Background()
 		}
 		if _, err := p.client.Account(ctx, event); err != nil {
 			logs.Warn.Println("plugins: Account call failed", p.name, err)
@@ -534,13 +547,9 @@ func pluginTopic(topic *Topic, action int) {
 			}
 		}
 
-		var ctx context.Context
-		var cancel context.CancelFunc
-		if p.timeout > 0 {
-			ctx, cancel = context.WithTimeout(context.Background(), p.timeout)
+		ctx, cancel := pluginContext(context.Background(), p, topic.tenantID)
+		if cancel != nil {
 			defer cancel()
-		} else {
-			ctx = context.Background()
 		}
 		if _, err := p.client.Topic(ctx, event); err != nil {
 			logs.Warn.Println("plugins: Topic call failed", p.name, err)
@@ -580,13 +589,9 @@ func pluginSubscription(sub *types.Subscription, action int) {
 			}
 		}
 
-		var ctx context.Context
-		var cancel context.CancelFunc
-		if p.timeout > 0 {
-			ctx, cancel = context.WithTimeout(context.Background(), p.timeout)
+		ctx, cancel := pluginContext(context.Background(), p, sub.TenantID)
+		if cancel != nil {
 			defer cancel()
-		} else {
-			ctx = context.Background()
 		}
 		if _, err := p.client.Subscription(ctx, event); err != nil {
 			logs.Warn.Println("plugins: Subscription call failed", p.name, err)
@@ -595,7 +600,7 @@ func pluginSubscription(sub *types.Subscription, action int) {
 }
 
 // Message accepted for delivery
-func pluginMessage(data *MsgServerData, action int) {
+func pluginMessage(tenantID types.TenantID, data *MsgServerData, action int) {
 	if globals.plugins == nil || action != plgActCreate {
 		return
 	}
@@ -615,13 +620,9 @@ func pluginMessage(data *MsgServerData, action int) {
 			}
 		}
 
-		var ctx context.Context
-		var cancel context.CancelFunc
-		if p.timeout > 0 {
-			ctx, cancel = context.WithTimeout(context.Background(), p.timeout)
+		ctx, cancel := pluginContext(context.Background(), p, tenantID)
+		if cancel != nil {
 			defer cancel()
-		} else {
-			ctx = context.Background()
 		}
 		if _, err := p.client.Message(ctx, event); err != nil {
 			logs.Warn.Println("plugins: Message call failed", p.name, err)

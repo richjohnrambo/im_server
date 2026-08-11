@@ -33,7 +33,7 @@ type Validator interface {
 	//   lang: user's human language as repored in the session.
 	//   resp: optional response if user already has it (i.e. captcha/recaptcha).
 	//   tmpToken: temporary authentication token to include in the request.
-	Request(user t.Uid, cred, lang, resp string, tmpToken []byte) (bool, error)
+	Request(tenantID t.TenantID, user t.Uid, cred, lang, resp string, tmpToken []byte) (bool, error)
 
 	// ResetSecret sends a message with instructions for resetting an authentication secret.
 	//   cred: address to use for the message.
@@ -41,17 +41,17 @@ type Validator interface {
 	//   lang: human language as reported in the session.
 	//   tmpToken: temporary authentication token
 	//   params: authentication params.
-	ResetSecret(cred, scheme, lang string, tmpToken []byte, params map[string]any) error
+	ResetSecret(tenantID t.TenantID, cred, scheme, lang string, tmpToken []byte, params map[string]any) error
 
 	// Check checks validity of user's response.
 	// Returns the value of validated credential on success.
-	Check(user t.Uid, resp string) (string, error)
+	Check(tenantID t.TenantID, user t.Uid, resp string) (string, error)
 
 	// Remove deletes or deactivates user's given value.
-	Remove(user t.Uid, value string) error
+	Remove(tenantID t.TenantID, user t.Uid, value string) error
 
 	// Delete deletes user's record.
-	Delete(user t.Uid) error
+	Delete(tenantID t.TenantID, user t.Uid) error
 
 	// TempAuthScheme returns a temporary authentication method used by this validator.
 	// It should be either "code" or "token".

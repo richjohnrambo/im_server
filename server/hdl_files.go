@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/tinode/chat/pbx"
+	"github.com/tinode/chat/server/auth"
 	"github.com/tinode/chat/server/logs"
 	"github.com/tinode/chat/server/store"
 	"github.com/tinode/chat/server/store/types"
@@ -52,7 +53,7 @@ func largeFileServeHTTP(wrt http.ResponseWriter, req *http.Request) {
 
 	// Preflight request: process before any security checks.
 	if req.Method == http.MethodOptions {
-		headers, statusCode, err := mh.Headers(req.Method, req.URL, req.Header, true)
+		headers, statusCode, err := mh.Headers(types.ZeroTenantID, req.Method, req.URL, req.Header, true)
 		if err != nil {
 			writeHttpResponse(decodeStoreError(err, "", now, nil), err)
 			return
@@ -84,7 +85,7 @@ func largeFileServeHTTP(wrt http.ResponseWriter, req *http.Request) {
 
 	// Check authorization: either auth information or SID must be present
 	authMethod, secret := getHttpAuth(req)
-	uid, challenge, err := authFileRequest(authMethod, secret, req.FormValue("sid"), getRemoteAddr(req))
+	tenantID, uid, challenge, err := authFileRequest(authMethod, secret, req.FormValue("sid"), getRemoteAddr(req))
 	if err != nil {
 		writeHttpResponse(decodeStoreError(err, "", now, nil), err)
 		return
@@ -102,7 +103,7 @@ func largeFileServeHTTP(wrt http.ResponseWriter, req *http.Request) {
 	}
 
 	// Check if media handler redirects or adds headers.
-	headers, statusCode, err := mh.Headers(req.Method, req.URL, req.Header, true)
+	headers, statusCode, err := mh.Headers(tenantID, req.Method, req.URL, req.Header, true)
 	if err != nil {
 		writeHttpResponse(decodeStoreError(err, "", now, nil), err)
 		return
@@ -136,7 +137,7 @@ func largeFileServeHTTP(wrt http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	fd, rsc, err := mh.Download(req.URL.String())
+	fd, rsc, err := mh.Download(tenantID, req.URL.String())
 	if err != nil {
 		writeHttpResponse(decodeStoreError(err, "", now, nil), err)
 		return
@@ -186,7 +187,7 @@ func largeFileReceiveHTTP(wrt http.ResponseWriter, req *http.Request) {
 
 	// Preflight request: process before any security checks.
 	if req.Method == http.MethodOptions {
-		headers, statusCode, err := mh.Headers(req.Method, req.URL, req.Header, true)
+		headers, statusCode, err := mh.Headers(types.ZeroTenantID, req.Method, req.URL, req.Header, true)
 		if err != nil {
 			writeHttpResponse(decodeStoreError(err, "", now, nil), err)
 			return
@@ -224,7 +225,7 @@ func largeFileReceiveHTTP(wrt http.ResponseWriter, req *http.Request) {
 	msgID := req.FormValue("id")
 	// Check authorization: either auth information or SID must be present
 	authMethod, secret := getHttpAuth(req)
-	uid, challenge, err := authFileRequest(authMethod, secret, req.FormValue("sid"), getRemoteAddr(req))
+	tenantID, uid, challenge, err := authFileRequest(authMethod, secret, req.FormValue("sid"), getRemoteAddr(req))
 	if err != nil {
 		writeHttpResponse(decodeStoreError(err, msgID, now, nil), err)
 		return
@@ -240,7 +241,7 @@ func largeFileReceiveHTTP(wrt http.ResponseWriter, req *http.Request) {
 	}
 
 	// Check if uploads are handled elsewhere.
-	headers, statusCode, err := mh.Headers(req.Method, req.URL, req.Header, true)
+	headers, statusCode, err := mh.Headers(tenantID, req.Method, req.URL, req.Header, true)
 	if err != nil {
 		logs.Info.Println("media upload: headers check failed", err)
 		writeHttpResponse(decodeStoreError(err, "", now, nil), err)
@@ -312,6 +313,7 @@ func largeFileReceiveHTTP(wrt http.ResponseWriter, req *http.Request) {
 		ObjHeader: types.ObjHeader{
 			Id: store.Store.GetUidString(),
 		},
+		TenantID: tenantID,
 		User:     uid.String(),
 		MimeType: mimeType,
 	}
@@ -325,12 +327,12 @@ func largeFileReceiveHTTP(wrt http.ResponseWriter, req *http.Request) {
 	url, size, err := mh.Upload(fdef, file)
 	if err != nil {
 		logs.Info.Println("media upload: failed", file, "key", fdef.Location, err)
-		store.Files.FinishUpload(fdef, false, 0)
+		store.Files.FinishUpload(tenantID, fdef, false, 0)
 		writeHttpResponse(decodeStoreError(err, msgID, now, nil), err)
 		return
 	}
 
-	fdef, err = store.Files.FinishUpload(fdef, true, size)
+	fdef, err = store.Files.FinishUpload(tenantID, fdef, true, size)
 	if err != nil {
 		logs.Info.Println("media upload: failed to finalize", file, "key", fdef.Location, err)
 		// Best effort cleanup.
@@ -368,7 +370,7 @@ func (*grpcNodeServer) LargeFileServe(req *pbx.FileDownReq, stream pbx.Node_Larg
 	if p, ok := peer.FromContext(stream.Context()); ok {
 		remoteAddr = p.Addr.String()
 	}
-	uid, challenge, err := authFileRequest(authMethod, secret, "", remoteAddr)
+	tenantID, uid, challenge, err := authFileRequest(authMethod, secret, "", remoteAddr)
 	if err != nil {
 		writeResponse(decodeStoreError(err, msgID, now, nil), err)
 		return nil
@@ -388,7 +390,7 @@ func (*grpcNodeServer) LargeFileServe(req *pbx.FileDownReq, stream pbx.Node_Larg
 	// Check if media handler redirects or adds headers.
 	mh := store.Store.GetMediaHandler()
 	url, _ := url.Parse(req.Uri)
-	headers, statusCode, err := mh.Headers(http.MethodGet, url, http.Header{}, true)
+	headers, statusCode, err := mh.Headers(tenantID, http.MethodGet, url, http.Header{}, true)
 	if err != nil {
 		writeResponse(decodeStoreError(err, "", now, nil), err)
 		return nil
@@ -405,7 +407,7 @@ func (*grpcNodeServer) LargeFileServe(req *pbx.FileDownReq, stream pbx.Node_Larg
 		return nil
 	}
 
-	fd, rsc, err := mh.Download(req.GetUri())
+	fd, rsc, err := mh.Download(tenantID, req.GetUri())
 	if err != nil {
 		writeResponse(decodeStoreError(err, msgID, now, nil), err)
 		return nil
@@ -472,7 +474,7 @@ func (*grpcNodeServer) LargeFileReceive(stream pbx.Node_LargeFileReceiveServer) 
 	if p, ok := peer.FromContext(stream.Context()); ok {
 		remoteAddr = p.Addr.String()
 	}
-	uid, challenge, err := authFileRequest(authMethod, secret, "", remoteAddr)
+	tenantID, uid, challenge, err := authFileRequest(authMethod, secret, "", remoteAddr)
 	if err != nil {
 		writeResponse(decodeStoreError(err, msgID, now, nil), err)
 		return nil
@@ -490,7 +492,7 @@ func (*grpcNodeServer) LargeFileReceive(stream pbx.Node_LargeFileReceiveServer) 
 	}
 
 	// Check if uploads are handled elsewhere.
-	headers, statusCode, err := mh.Headers(http.MethodPost, nil, http.Header{}, false)
+	headers, statusCode, err := mh.Headers(tenantID, http.MethodPost, nil, http.Header{}, false)
 	if err != nil {
 		logs.Info.Println("media upload: headers check failed", err)
 		writeResponse(decodeStoreError(err, "", now, nil), nil)
@@ -521,6 +523,7 @@ func (*grpcNodeServer) LargeFileReceive(stream pbx.Node_LargeFileReceiveServer) 
 		ObjHeader: types.ObjHeader{
 			Id: store.Store.GetUidString(),
 		},
+		TenantID: tenantID,
 		User:     uid.String(),
 		MimeType: mimeType,
 	}
@@ -555,7 +558,7 @@ func (*grpcNodeServer) LargeFileReceive(stream pbx.Node_LargeFileReceiveServer) 
 	}
 	if err != nil {
 		logs.Info.Println("media upload: failed", req.Meta.Name, "key", fdef.Location, err)
-		store.Files.FinishUpload(fdef, false, 0)
+		store.Files.FinishUpload(tenantID, fdef, false, 0)
 		writeResponse(decodeStoreError(err, msgID, now, nil), nil)
 		return nil
 	}
@@ -588,8 +591,10 @@ func largeFileRunGarbageCollection(period time.Duration, blockSize int) chan<- b
 		for {
 			select {
 			case <-gcTicker:
-				if err := store.Files.DeleteUnused(time.Now().Add(-time.Hour), blockSize); err != nil {
-					logs.Warn.Println("media gc:", err)
+				for _, tenantID := range store.KnownTenantIDs() {
+					if err := store.Files.DeleteUnused(tenantID, time.Now().Add(-time.Hour), blockSize); err != nil {
+						logs.Warn.Println("media gc:", tenantID, err)
+					}
 				}
 			case <-stop:
 				return
@@ -601,35 +606,41 @@ func largeFileRunGarbageCollection(period time.Duration, blockSize int) chan<- b
 }
 
 // Authenticate non-websocket HTTP request
-func authFileRequest(authMethod, secret, sid, remoteAddr string) (types.Uid, []byte, error) {
+func authFileRequest(authMethod, secret, sid, remoteAddr string) (types.TenantID, types.Uid, []byte, error) {
+	var tenantID types.TenantID
 	var uid types.Uid
 	if authMethod != "" {
 		decodedSecret := make([]byte, base64.StdEncoding.DecodedLen(len(secret)))
 		n, err := base64.StdEncoding.Decode(decodedSecret, []byte(secret))
 		if err != nil {
 			logs.Info.Println("media: invalid auth secret", authMethod, "'"+secret+"'")
-			return uid, nil, types.ErrMalformed
+			return tenantID, uid, nil, types.ErrMalformed
 		}
 
 		if authhdl := store.Store.GetLogicalAuthHandler(authMethod); authhdl != nil {
-			rec, challenge, err := authhdl.Authenticate(decodedSecret[:n], remoteAddr)
+			rec, challenge, err := authhdl.Authenticate(auth.AuthContext{RemoteAddr: remoteAddr}, decodedSecret[:n])
 			if err != nil {
-				return uid, nil, err
+				return tenantID, uid, nil, err
 			}
 			if challenge != nil {
-				return uid, challenge, nil
+				return tenantID, uid, challenge, nil
 			}
+			if rec == nil || rec.TenantID.IsZero() || rec.Uid.IsZero() {
+				return tenantID, uid, nil, types.ErrFailed
+			}
+			tenantID = rec.TenantID
 			uid = rec.Uid
 		} else {
 			logs.Info.Println("media: unknown auth method", authMethod)
-			return uid, nil, types.ErrMalformed
+			return tenantID, uid, nil, types.ErrMalformed
 		}
 	} else {
 		// Find the session, make sure it's appropriately authenticated.
 		sess := globals.sessionStore.Get(sid)
 		if sess != nil {
+			tenantID = sess.tenantID
 			uid = sess.uid
 		}
 	}
-	return uid, nil, nil
+	return tenantID, uid, nil, nil
 }

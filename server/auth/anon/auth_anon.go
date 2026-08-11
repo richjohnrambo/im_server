@@ -38,7 +38,10 @@ func (a *authenticator) IsInitialized() bool {
 
 // AddRecord checks authLevel and assigns default LevelAnon. Otherwise it
 // just reports success.
-func (authenticator) AddRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
+func (authenticator) AddRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
+	if err := auth.BindRecord(ctx, rec); err != nil {
+		return nil, err
+	}
 	if rec.AuthLevel == auth.LevelNone {
 		rec.AuthLevel = auth.LevelAnon
 	}
@@ -47,12 +50,12 @@ func (authenticator) AddRecord(rec *auth.Rec, secret []byte, remoteAddr string) 
 }
 
 // UpdateRecord is a noop. Just report success.
-func (authenticator) UpdateRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
-	return rec, nil
+func (authenticator) UpdateRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
+	return rec, auth.BindRecord(ctx, rec)
 }
 
 // Authenticate is not supported. This authenticator is used only at account creation time.
-func (authenticator) Authenticate(secret []byte, remoteAddr string) (*auth.Rec, []byte, error) {
+func (authenticator) Authenticate(ctx auth.AuthContext, secret []byte) (*auth.Rec, []byte, error) {
 	return nil, nil, types.ErrUnsupported
 }
 
@@ -62,7 +65,10 @@ func (authenticator) AsTag(token string) string {
 }
 
 // IsUnique for a noop. Anonymous login does not use secret, any secret is fine.
-func (authenticator) IsUnique(secret []byte, remoteAddr string) (bool, error) {
+func (authenticator) IsUnique(ctx auth.AuthContext, secret []byte) (bool, error) {
+	if !ctx.IsValid() {
+		return false, types.ErrMalformed
+	}
 	return true, nil
 }
 
@@ -72,7 +78,7 @@ func (authenticator) GenSecret(rec *auth.Rec) ([]byte, time.Time, error) {
 }
 
 // DelRecords is a noop which always succeeds.
-func (authenticator) DelRecords(uid types.Uid) error {
+func (authenticator) DelRecords(tenantID types.TenantID, uid types.Uid) error {
 	return nil
 }
 
@@ -83,7 +89,7 @@ func (authenticator) RestrictedTags() ([]string, error) {
 
 // GetResetParams returns authenticator parameters passed to password reset handler
 // (none for anonymous).
-func (authenticator) GetResetParams(uid types.Uid) (map[string]any, error) {
+func (authenticator) GetResetParams(tenantID types.TenantID, uid types.Uid) (map[string]any, error) {
 	return nil, nil
 }
 

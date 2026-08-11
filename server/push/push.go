@@ -36,6 +36,7 @@ type Recipient struct {
 
 // Receipt is the push payload with a list of recipients.
 type Receipt struct {
+	TenantID t.TenantID `json:"-"`
 	// List of individual recipients, including those who did not receive the message.
 	To map[t.Uid]Recipient `json:"to"`
 	// Push topic for group notifications.
@@ -48,6 +49,7 @@ type Receipt struct {
 // - If DeviceID is provided, it's subscribed/unsubscribed to all user's channels.
 // - If Channel is provided, then all user's devices are subscribed/unsubscribed from the channel.
 type ChannelReq struct {
+	TenantID t.TenantID
 	// Uid is the ID of the user making request.
 	Uid t.Uid
 	// DeviceID is the device-provided token in case a single device is being subscribed to all channels.

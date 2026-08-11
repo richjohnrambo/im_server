@@ -182,6 +182,31 @@ func (f *Feature) UnmarshalJSON(b []byte) error {
 // Duration is identical to time.Duration except it can be sanely unmarshallend from JSON.
 type Duration time.Duration
 
+// AuthContext is server-owned context for an authentication operation.
+// TenantID must be resolved before invoking an authenticator.
+type AuthContext struct {
+	TenantID   types.TenantID
+	RemoteAddr string
+}
+
+// IsValid reports whether the authentication context is bound to a tenant.
+func (ctx AuthContext) IsValid() bool {
+	return !ctx.TenantID.IsZero()
+}
+
+// BindRecord validates the authentication context and binds a record to it.
+// A record which is already bound to another tenant is rejected.
+func BindRecord(ctx AuthContext, rec *Rec) error {
+	if !ctx.IsValid() || rec == nil {
+		return types.ErrMalformed
+	}
+	if !rec.TenantID.IsZero() && rec.TenantID != ctx.TenantID {
+		return types.ErrFailed
+	}
+	rec.TenantID = ctx.TenantID
+	return nil
+}
+
 // UnmarshalJSON handles the cases where duration is specified in JSON as a "5000s" string or just plain seconds.
 func (d *Duration) UnmarshalJSON(b []byte) error {
 	var v any
@@ -206,6 +231,8 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 // Rec is an authentication record.
 type Rec struct {
+	// Tenant which owns this authentication record.
+	TenantID types.TenantID `json:"tenant_id,omitempty"`
 	// User ID.
 	Uid types.Uid `json:"uid,omitempty"`
 	// Authentication level.
@@ -238,11 +265,11 @@ type AuthHandler interface {
 
 	// AddRecord adds persistent authentication record to the database.
 	// Returns: updated auth record, error
-	AddRecord(rec *Rec, secret []byte, remoteAddr string) (*Rec, error)
+	AddRecord(ctx AuthContext, rec *Rec, secret []byte) (*Rec, error)
 
 	// UpdateRecord updates existing record with new credentials.
 	// Returns updated auth record, error.
-	UpdateRecord(rec *Rec, secret []byte, remoteAddr string) (*Rec, error)
+	UpdateRecord(ctx AuthContext, rec *Rec, secret []byte) (*Rec, error)
 
 	// Authenticate: given a user-provided authentication secret (such as "login:password"), either
 	// return user's record (ID, time when the secret expires, etc), or issue a challenge to
@@ -251,7 +278,7 @@ type AuthHandler interface {
 	// additional validation. The stock authenticators don't use it.
 	// store.Users.GetAuthRecord("scheme", "unique")
 	// Returns: user auth record, challenge, error.
-	Authenticate(secret []byte, remoteAddr string) (*Rec, []byte, error)
+	Authenticate(ctx AuthContext, secret []byte) (*Rec, []byte, error)
 
 	// AsTag converts search token into prefixed tag or an empty string if it
 	// cannot be represented as a prefixed tag.
@@ -259,13 +286,13 @@ type AuthHandler interface {
 
 	// IsUnique verifies if the provided secret can be considered unique by the auth scheme
 	// E.g. if login is unique. It also may check for policy compliance, i.e. not too short, etc.
-	IsUnique(secret []byte, remoteAddr string) (bool, error)
+	IsUnique(ctx AuthContext, secret []byte) (bool, error)
 
 	// GenSecret generates a new secret, if appropriate.
 	GenSecret(rec *Rec) ([]byte, time.Time, error)
 
 	// DelRecords deletes (or disables) all authentication records for the given user.
-	DelRecords(uid types.Uid) error
+	DelRecords(tenantID types.TenantID, uid types.Uid) error
 
 	// RestrictedTags returns the tag namespaces (prefixes) which are restricted by this authenticator.
 	RestrictedTags() ([]string, error)
@@ -273,7 +300,7 @@ type AuthHandler interface {
 	// GetResetParams returns authenticator parameters passed to password reset handler
 	// for the provided user id.
 	// Returns: map of params.
-	GetResetParams(uid types.Uid) (map[string]any, error)
+	GetResetParams(tenantID types.TenantID, uid types.Uid) (map[string]any, error)
 
 	// GetRealName returns the hardcoded name of the authenticator.
 	GetRealName() string

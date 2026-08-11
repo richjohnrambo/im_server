@@ -122,6 +122,7 @@ func (n *ClusterNode) p2mSenderLoop() {
 
 // ClusterSess is a basic info on a remote session where the message was created.
 type ClusterSess struct {
+	TenantID types.TenantID
 	// IP address of the client. For long polling this is the IP of the last poll
 	RemoteAddr string
 
@@ -158,6 +159,7 @@ type ClusterSess struct {
 // ClusterSessUpdate represents a request to update a session.
 // User Agent change or background session comes to foreground.
 type ClusterSessUpdate struct {
+	TenantID types.TenantID
 	// User this session represents.
 	Uid types.Uid
 	// Session id.
@@ -168,6 +170,7 @@ type ClusterSessUpdate struct {
 
 // ClusterReq is either a Proxy to Master or Topic Proxy to Topic Master or intra-cluster routing request message.
 type ClusterReq struct {
+	TenantID types.TenantID
 	// Name of the node sending this request
 	Node string
 
@@ -198,6 +201,7 @@ type ClusterReq struct {
 
 // ClusterRoute is intra-cluster routing request message.
 type ClusterRoute struct {
+	TenantID types.TenantID
 	// Name of the node sending this request
 	Node string
 
@@ -219,6 +223,7 @@ type ClusterRoute struct {
 
 // ClusterResp is a Master to Proxy response message.
 type ClusterResp struct {
+	TenantID types.TenantID
 	// Server message with the response.
 	SrvMsg *ServerComMessage
 	// Originating session ID to forward response to, if any.
@@ -468,6 +473,12 @@ func (n *ClusterNode) stopMultiplexingSession(msess *Session) {
 // TopicMaster is a gRPC endpoint which receives requests sent by proxy topic to master topic.
 func (c *Cluster) TopicMaster(msg *ClusterReq, rejected *bool) error {
 	*rejected = false
+	if !msg.TenantID.IsValid() || (msg.CliMsg != nil && msg.CliMsg.TenantID != msg.TenantID) ||
+		(msg.Sess != nil && msg.Sess.TenantID != msg.TenantID) {
+		logs.Warn.Println("cluster TopicMaster: invalid tenant context", msg.TenantID)
+		*rejected = true
+		return nil
+	}
 
 	node := c.nodes[msg.Node]
 	if node == nil {
@@ -487,7 +498,7 @@ func (c *Cluster) TopicMaster(msg *ClusterReq, rejected *bool) error {
 		msid = msg.RcptTo
 	}
 	// Append node name.
-	msid += "-" + msg.Node
+	msid = (types.TopicKey{TenantID: msg.TenantID, Topic: msid}).RoutingKey() + "-" + msg.Node
 	msess := globals.sessionStore.Get(msid)
 
 	if msg.Gone {
@@ -495,9 +506,10 @@ func (c *Cluster) TopicMaster(msg *ClusterReq, rejected *bool) error {
 		// If it was the last session, master topic will shut down as well.
 		node.stopMultiplexingSession(msess)
 
-		if t := globals.hub.topicGet(msg.RcptTo); t != nil && t.isChan {
+		key := types.TopicKey{TenantID: msg.TenantID, Topic: msg.RcptTo}
+		if t := globals.hub.topicGet(key); t != nil && t.isChan {
 			// If it's a channel topic, also stop the "chnX-" local auxiliary session.
-			msidChn := types.GrpToChn(t.name) + "-" + msg.Node
+			msidChn := (types.TopicKey{TenantID: msg.TenantID, Topic: types.GrpToChn(t.name)}).RoutingKey() + "-" + msg.Node
 			node.stopMultiplexingSession(globals.sessionStore.Get(msidChn))
 		}
 
@@ -521,6 +533,7 @@ func (c *Cluster) TopicMaster(msg *ClusterReq, rejected *bool) error {
 
 		logs.Info.Println("cluster: multiplexing session started", msid, count)
 		msess.proxiedTopic = msg.RcptTo
+		msess.tenantID = msg.TenantID
 	}
 
 	// This is a local copy of a remote session.
@@ -529,7 +542,8 @@ func (c *Cluster) TopicMaster(msg *ClusterReq, rejected *bool) error {
 	if msg.Sess != nil {
 		// We only need some session info. No need to copy everything.
 		sess = &Session{
-			proto: PROXY,
+			proto:    PROXY,
+			tenantID: msg.TenantID,
 			// Multiplexing session which actually handles the communication.
 			multi: msess,
 			// Local parameters specific to this session.
@@ -561,14 +575,14 @@ func (c *Cluster) TopicMaster(msg *ClusterReq, rejected *bool) error {
 		}
 
 	case ProxyReqLeave:
-		if t := globals.hub.topicGet(msg.RcptTo); t != nil {
+		if t := globals.hub.topicGet(types.TopicKey{TenantID: msg.TenantID, Topic: msg.RcptTo}); t != nil {
 			t.unreg <- msg.CliMsg
 		} else {
 			logs.Warn.Println("cluster: leave request for unknown topic", msg.RcptTo)
 		}
 
 	case ProxyReqMeta:
-		if t := globals.hub.topicGet(msg.RcptTo); t != nil {
+		if t := globals.hub.topicGet(types.TopicKey{TenantID: msg.TenantID, Topic: msg.RcptTo}); t != nil {
 			select {
 			case t.meta <- msg.CliMsg:
 			default:
@@ -589,7 +603,7 @@ func (c *Cluster) TopicMaster(msg *ClusterReq, rejected *bool) error {
 
 	case ProxyReqBgSession, ProxyReqMeUserAgent:
 		// sess could be nil
-		if t := globals.hub.topicGet(msg.RcptTo); t != nil {
+		if t := globals.hub.topicGet(types.TopicKey{TenantID: msg.TenantID, Topic: msg.RcptTo}); t != nil {
 			if t.supd == nil {
 				logs.Err.Panicln("cluster: invalid topic category in session update", t.name, msg.ReqType)
 			}
@@ -614,9 +628,13 @@ func (c *Cluster) TopicMaster(msg *ClusterReq, rejected *bool) error {
 
 // TopicProxy is a gRPC endpoint at topic proxy which receives topic master responses.
 func (Cluster) TopicProxy(msg *ClusterResp, unused *bool) error {
+	if !msg.TenantID.IsValid() || msg.SrvMsg == nil || msg.SrvMsg.TenantID != msg.TenantID {
+		logs.Warn.Println("cluster TopicProxy: invalid tenant context", msg.TenantID)
+		return nil
+	}
 	// This cluster member received a response from the topic master to be forwarded to the topic.
 	// Find appropriate topic, send the message to it.
-	if t := globals.hub.topicGet(msg.RcptTo); t != nil {
+	if t := globals.hub.topicGet(types.TopicKey{TenantID: msg.TenantID, Topic: msg.RcptTo}); t != nil {
 		msg.SrvMsg.uid = types.ParseUserId(msg.SrvMsg.AsUser)
 		select {
 		case t.proxy <- msg:
@@ -653,6 +671,11 @@ func (c *Cluster) Route(msg *ClusterRoute, rejected *bool) error {
 		logError("cluster Route: nil server message")
 		return nil
 	}
+	if !msg.TenantID.IsValid() || msg.SrvMsg.TenantID != msg.TenantID ||
+		(msg.Sess != nil && msg.Sess.TenantID != msg.TenantID) {
+		logError("cluster Route: invalid tenant context")
+		return nil
+	}
 
 	select {
 	case globals.hub.routeSrv <- msg.SrvMsg:
@@ -671,7 +694,7 @@ func (c *Cluster) UserCacheUpdate(msg *UserCacheReq, rejected *bool) error {
 		// User is deleted. Evict all user's sessions.
 		globals.sessionStore.EvictUser(msg.UserId, "")
 
-		if globals.cluster.isRemoteTopic(msg.UserId.UserId()) {
+		if globals.cluster.isRemoteTopic(types.TopicKey{TenantID: msg.TenantID, Topic: msg.UserId.UserId()}) {
 			// No need to delete user's cache if user is remote.
 			return nil
 		}
@@ -711,16 +734,18 @@ func (c *Cluster) routeUserReq(req *UserCacheReq) error {
 	if req.PushRcpt != nil {
 		// Request to send push notifications. Create separate packets for each affected cluster node.
 		for uid, recipient := range req.PushRcpt.To {
-			n := c.nodeForTopic(uid.UserId())
+			n := c.nodeForTopic(types.TopicKey{TenantID: req.TenantID, Topic: uid.UserId()})
 			if n == nil {
 				return errors.New("attempt to update user at a non-existent node (1)")
 			}
 			r := reqByNode[n.name]
 			if r == nil {
 				r = &UserCacheReq{
+					TenantID: req.TenantID,
 					PushRcpt: &push.Receipt{
-						Payload: req.PushRcpt.Payload,
-						To:      make(map[types.Uid]push.Recipient),
+						TenantID: req.TenantID,
+						Payload:  req.PushRcpt.Payload,
+						To:       make(map[types.Uid]push.Recipient),
 					},
 					Node: c.thisNodeName,
 				}
@@ -731,20 +756,20 @@ func (c *Cluster) routeUserReq(req *UserCacheReq) error {
 	} else if len(req.UserIdList) > 0 {
 		// Request to add/remove some users from cache.
 		for _, uid := range req.UserIdList {
-			n := c.nodeForTopic(uid.UserId())
+			n := c.nodeForTopic(types.TopicKey{TenantID: req.TenantID, Topic: uid.UserId()})
 			if n == nil {
 				return errors.New("attempt to update user at a non-existent node (2)")
 			}
 			r := reqByNode[n.name]
 			if r == nil {
-				r = &UserCacheReq{Node: c.thisNodeName, Inc: req.Inc}
+				r = &UserCacheReq{TenantID: req.TenantID, Node: c.thisNodeName, Inc: req.Inc}
 			}
 			r.UserIdList = append(r.UserIdList, uid)
 			reqByNode[n.name] = r
 		}
 	} else if req.Gone {
 		// Message that the user is deleted is sent to all nodes.
-		r := &UserCacheReq{Node: c.thisNodeName, UserIdList: req.UserIdList, Gone: true}
+		r := &UserCacheReq{TenantID: req.TenantID, Node: c.thisNodeName, UserIdList: req.UserIdList, Gone: true}
 		for _, n := range c.nodes {
 			reqByNode[n.name] = r
 		}
@@ -766,7 +791,7 @@ func (c *Cluster) routeUserReq(req *UserCacheReq) error {
 	}
 
 	// Update to cached values.
-	n := c.nodeForTopic(req.UserId.UserId())
+	n := c.nodeForTopic(types.TopicKey{TenantID: req.TenantID, Topic: req.UserId.UserId()})
 	if n == nil {
 		return errors.New("attempt to update user at a non-existent node (3)")
 	}
@@ -780,32 +805,35 @@ func (c *Cluster) routeUserReq(req *UserCacheReq) error {
 }
 
 // Given topic name, find appropriate cluster node to route message to.
-func (c *Cluster) nodeForTopic(topic string) *ClusterNode {
-	key := c.ring.Get(topic)
-	if key == c.thisNodeName {
+func (c *Cluster) nodeForTopic(topic types.TopicKey) *ClusterNode {
+	if !topic.IsValid() {
+		return nil
+	}
+	nodeName := c.ring.Get(topic.RoutingKey())
+	if nodeName == c.thisNodeName {
 		logs.Err.Println("cluster: request to route to self")
 		// Do not route to self
 		return nil
 	}
 
-	node := c.nodes[key]
+	node := c.nodes[nodeName]
 	if node == nil {
-		logs.Warn.Println("cluster: no node for topic", topic, key)
+		logs.Warn.Println("cluster: no node for topic", topic.RoutingKey(), nodeName)
 	}
 	return node
 }
 
 // isRemoteTopic checks if the given topic is handled by this node or a remote node.
-func (c *Cluster) isRemoteTopic(topic string) bool {
+func (c *Cluster) isRemoteTopic(topic types.TopicKey) bool {
 	if c == nil {
 		// Cluster not initialized, all topics are local
 		return false
 	}
-	return c.ring.Get(topic) != c.thisNodeName
+	return topic.IsValid() && c.ring.Get(topic.RoutingKey()) != c.thisNodeName
 }
 
 // genLocalTopicName is just like genTopicName(), but the generated name belongs to the current cluster node.
-func (c *Cluster) genLocalTopicName() string {
+func (c *Cluster) genLocalTopicName(tenantID types.TenantID) string {
 	topic := genTopicName()
 	if c == nil {
 		// Cluster not initialized, all topics are local
@@ -813,7 +841,7 @@ func (c *Cluster) genLocalTopicName() string {
 	}
 
 	// TODO: if cluster is large it may become too inefficient.
-	for c.ring.Get(topic) != c.thisNodeName {
+	for c.ring.Get((types.TopicKey{TenantID: tenantID, Topic: topic}).RoutingKey()) != c.thisNodeName {
 		topic = genTopicName()
 	}
 	return topic
@@ -835,7 +863,14 @@ func (c *Cluster) isPartitioned() bool {
 }
 
 func (c *Cluster) makeClusterReq(reqType ProxyReqType, msg *ClientComMessage, topic string, sess *Session) *ClusterReq {
+	tenantID := types.ZeroTenantID
+	if msg != nil {
+		tenantID = msg.TenantID
+	} else if sess != nil {
+		tenantID = sess.tenantID
+	}
 	req := &ClusterReq{
+		TenantID:    tenantID,
 		Node:        c.thisNodeName,
 		Signature:   c.ring.Signature(),
 		Fingerprint: c.fingerprint,
@@ -856,6 +891,7 @@ func (c *Cluster) makeClusterReq(reqType ProxyReqType, msg *ClientComMessage, to
 		}
 
 		req.Sess = &ClusterSess{
+			TenantID:    tenantID,
 			Uid:         uid,
 			AuthLvl:     sess.authLvl,
 			RemoteAddr:  sess.remoteAddr,
@@ -890,7 +926,7 @@ func (c *Cluster) routeToTopicMaster(reqType ProxyReqType, msg *ClientComMessage
 	req := c.makeClusterReq(reqType, msg, topic, sess)
 
 	// Find the cluster node which owns the topic, then forward to it.
-	n := c.nodeForTopic(topic)
+	n := c.nodeForTopic(types.TopicKey{TenantID: req.TenantID, Topic: topic})
 	if n == nil {
 		return errors.New("node for topic not found")
 	}
@@ -904,12 +940,13 @@ func (c *Cluster) routeToTopicIntraCluster(topic string, msg *ServerComMessage, 
 		return nil
 	}
 
-	n := c.nodeForTopic(topic)
+	n := c.nodeForTopic(types.TopicKey{TenantID: msg.TenantID, Topic: topic})
 	if n == nil {
 		return errors.New("node for topic not found (intra)")
 	}
 
 	route := &ClusterRoute{
+		TenantID:    msg.TenantID,
 		Node:        c.thisNodeName,
 		Signature:   c.ring.Signature(),
 		Fingerprint: c.fingerprint,
@@ -917,25 +954,25 @@ func (c *Cluster) routeToTopicIntraCluster(topic string, msg *ServerComMessage, 
 	}
 
 	if sess != nil {
-		route.Sess = &ClusterSess{Sid: sess.sid}
+		route.Sess = &ClusterSess{TenantID: sess.tenantID, Sid: sess.sid}
 	}
 	return n.route(route)
 }
 
 // Topic proxy terminated. Inform remote Master node that the proxy is gone.
-func (c *Cluster) topicProxyGone(topicName string) error {
+func (c *Cluster) topicProxyGone(tenantID types.TenantID, topicName string) error {
 	if c == nil {
 		// Cluster may be nil due to shutdown.
 		return nil
 	}
 
 	// Find the cluster node which owns the topic, then forward to it.
-	n := c.nodeForTopic(topicName)
+	n := c.nodeForTopic(types.TopicKey{TenantID: tenantID, Topic: topicName})
 	if n == nil {
 		return errors.New("node for topic not found")
 	}
 
-	req := c.makeClusterReq(ProxyReqLeave, nil, topicName, nil)
+	req := c.makeClusterReq(ProxyReqLeave, nil, topicName, &Session{tenantID: tenantID})
 	req.Gone = true
 	return n.proxyToMasterAsync(req)
 }
@@ -1144,7 +1181,7 @@ func (c *Cluster) invalidateProxySubs(forNode string) {
 			return true
 		}
 		if forNode == "" {
-			if topic.masterNode == c.ring.Get(topic.name) {
+			if topic.masterNode == c.ring.Get((types.TopicKey{TenantID: topic.tenantID, Topic: topic.name}).RoutingKey()) {
 				// The topic hasn't moved. Continue.
 				return true
 			}
@@ -1215,7 +1252,7 @@ func (sess *Session) clusterWriteLoop(forTopic string) {
 				return
 			}
 			srvMsg := msg.(*ServerComMessage)
-			response := &ClusterResp{SrvMsg: srvMsg}
+			response := &ClusterResp{TenantID: srvMsg.TenantID, SrvMsg: srvMsg}
 			if srvMsg.sess == nil {
 				response.OrigSid = "*"
 			} else {

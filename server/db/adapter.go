@@ -207,3 +207,89 @@ type Adapter interface {
 	// GetTestDB returns a currently open database connection.
 	GetTestDB() any
 }
+
+// TenantAdapter is an optional capability implemented by tenant-aware database adapters.
+// Keeping it separate lets adapters be migrated independently while tenant-aware entry
+// points fail closed when the configured adapter does not support tenant resolution.
+type TenantAdapter interface {
+	TenantGetByCode(code string) (*t.Tenant, error)
+}
+
+// TenantAuthAdapter is the tenant-aware authentication and credential capability.
+// It is separate from Adapter while the remaining persistence domains are migrated.
+type TenantAuthAdapter interface {
+	TenantAuthGetUniqueRecord(tenantID t.TenantID, unique string) (t.Uid, auth.Level, []byte, time.Time, error)
+	TenantAuthGetRecord(tenantID t.TenantID, user t.Uid, scheme string) (string, auth.Level, []byte, time.Time, error)
+	TenantAuthAddRecord(tenantID t.TenantID, user t.Uid, scheme, unique string, authLvl auth.Level,
+		secret []byte, expires time.Time) error
+	TenantAuthDelScheme(tenantID t.TenantID, user t.Uid, scheme string) error
+	TenantAuthUpdRecord(tenantID t.TenantID, user t.Uid, scheme, unique string, authLvl auth.Level,
+		secret []byte, expires time.Time) error
+	TenantUserGetByCred(tenantID t.TenantID, method, value string) (t.Uid, error)
+	TenantCredUpsert(tenantID t.TenantID, cred *t.Credential) (bool, error)
+	TenantCredGetActive(tenantID t.TenantID, uid t.Uid, method string) (*t.Credential, error)
+	TenantCredGetAll(tenantID t.TenantID, uid t.Uid, method string, validatedOnly bool) ([]t.Credential, error)
+	TenantCredDel(tenantID t.TenantID, uid t.Uid, method, value string) error
+	TenantCredConfirm(tenantID t.TenantID, uid t.Uid, method string) error
+	TenantCredFail(tenantID t.TenantID, uid t.Uid, method string) error
+}
+
+// TenantBusinessAdapter is the mandatory tenant-aware persistence capability
+// used by request handling code. Adapters which do not implement it fail closed
+// at the Store boundary instead of falling back to legacy unscoped queries.
+type TenantBusinessAdapter interface {
+	// TenantBusinessReady reports whether every method below enforces tenant
+	// isolation in its database queries. Startup is rejected while false.
+	TenantBusinessReady() bool
+
+	TenantUserCreate(t.TenantID, *t.User) error
+	TenantUserGet(t.TenantID, t.Uid) (*t.User, error)
+	TenantUserGetAll(t.TenantID, ...t.Uid) ([]t.User, error)
+	TenantUserDelete(t.TenantID, t.Uid, bool) error
+	TenantUserUpdate(t.TenantID, t.Uid, map[string]any) error
+	TenantUserUpdateTags(t.TenantID, t.Uid, []string, []string, []string) ([]string, error)
+	TenantUserUnreadCount(t.TenantID, ...t.Uid) (map[t.Uid]int, error)
+	TenantUserGetUnvalidated(t.TenantID, time.Time, int) ([]t.Uid, error)
+
+	TenantTopicCreate(t.TenantID, *t.Topic) error
+	TenantTopicCreateP2P(t.TenantID, *t.Subscription, *t.Subscription) error
+	TenantTopicGet(t.TenantID, string) (*t.Topic, error)
+	TenantTopicsForUser(t.TenantID, t.Uid, bool, *t.QueryOpt) ([]t.Subscription, error)
+	TenantUsersForTopic(t.TenantID, string, bool, *t.QueryOpt) ([]t.Subscription, error)
+	TenantOwnTopics(t.TenantID, t.Uid) ([]string, error)
+	TenantChannelsForUser(t.TenantID, t.Uid) ([]string, error)
+	TenantTopicShare(t.TenantID, string, []*t.Subscription) error
+	TenantTopicDelete(t.TenantID, string, bool, bool) error
+	TenantTopicUpdateOnMessage(t.TenantID, string, *t.Message) error
+	TenantTopicUpdateSubCnt(t.TenantID, string) error
+	TenantTopicUpdate(t.TenantID, string, map[string]any) error
+	TenantTopicOwnerChange(t.TenantID, string, t.Uid) error
+
+	TenantSubscriptionGet(t.TenantID, string, t.Uid, bool) (*t.Subscription, error)
+	TenantSubsForUser(t.TenantID, t.Uid) ([]t.Subscription, error)
+	TenantSubsForTopic(t.TenantID, string, bool, *t.QueryOpt) ([]t.Subscription, error)
+	TenantSubsUpdate(t.TenantID, string, t.Uid, map[string]any) error
+	TenantSubsDelete(t.TenantID, string, t.Uid) error
+	TenantFind(t.TenantID, string, string, [][]string, []string, bool) ([]t.Subscription, error)
+	TenantFindOne(t.TenantID, string) (string, error)
+
+	TenantMessageSave(t.TenantID, *t.Message) error
+	TenantMessageGetAll(t.TenantID, string, t.Uid, *t.QueryOpt) ([]t.Message, error)
+	TenantMessageDeleteList(t.TenantID, string, *t.DelMessage) error
+	TenantMessageGetDeleted(t.TenantID, string, t.Uid, *t.QueryOpt) ([]t.DelMessage, error)
+
+	TenantDeviceUpsert(t.TenantID, t.Uid, *t.DeviceDef) error
+	TenantDeviceGetAll(t.TenantID, ...t.Uid) (map[t.Uid][]t.DeviceDef, int, error)
+	TenantDeviceDelete(t.TenantID, t.Uid, string) error
+
+	TenantFileStartUpload(t.TenantID, *t.FileDef) error
+	TenantFileFinishUpload(t.TenantID, *t.FileDef, bool, int64) (*t.FileDef, error)
+	TenantFileGet(t.TenantID, string) (*t.FileDef, error)
+	TenantFileDeleteUnused(t.TenantID, time.Time, int) ([]string, error)
+	TenantFileLinkAttachments(t.TenantID, string, t.Uid, t.Uid, []string) error
+
+	TenantPCacheGet(t.TenantID, string) (string, error)
+	TenantPCacheUpsert(t.TenantID, string, string, bool) error
+	TenantPCacheDelete(t.TenantID, string) error
+	TenantPCacheExpire(t.TenantID, string, time.Time) error
+}

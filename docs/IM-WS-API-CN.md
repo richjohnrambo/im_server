@@ -66,7 +66,7 @@ wss://{host}/v0/channels?apikey={api_key}
 客户端连接成功后必须先发送 `{hi}`，再发送 `{login}` 或 `{acc}`。登录后建议立即订阅 `me` 和 `fnd`：
 
 ```json
-{"hi":{"id":"100","ver":"0.25","ua":"IM/1.0 (iOS)","platf":"ios","lang":"zh-CN"}}
+{"hi":{"id":"100","ver":"0.25","ua":"IM/1.0 (iOS)","platf":"ios","lang":"zh-CN","tenant":"acme"}}
 ```
 
 ```json
@@ -87,7 +87,7 @@ wss://{host}/v0/channels?apikey={api_key}
 
 | 包 | 用途 |
 |---|---|
-| `{hi}` | 握手、声明客户端版本和设备信息 |
+| `{hi}` | 握手、声明企业码、客户端版本和设备信息 |
 | `{acc}` | 注册、修改认证参数、提交验证码 |
 | `{login}` | 登录、Token 登录、重置密码流程 |
 | `{sub}` | 订阅/进入会话、创建群、创建私聊、拉取初始数据 |

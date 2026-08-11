@@ -23,9 +23,15 @@ type authenticator struct {
 	serialNumber int
 }
 
-// tokenLayout defines positioning of various bytes in token.
-// [8:UID][4:expires][2:authLevel][2:serial-number][2:feature-bits][32:signature] = 50 bytes
+const tokenVersion = uint8(2)
+
+// tokenLayout defines positioning of various bytes in token v2.
+// [1:version][8:tenant][8:UID][4:expires][2:authLevel][2:serial][2:features][32:signature] = 59 bytes.
 type tokenLayout struct {
+	// Token format version.
+	Version uint8
+	// Tenant ID.
+	TenantID uint64
 	// User ID.
 	Uid uint64
 	// Token expiration time.
@@ -82,21 +88,20 @@ func (ta *authenticator) IsInitialized() bool {
 }
 
 // AddRecord is not supported, will produce an error.
-func (authenticator) AddRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
+func (authenticator) AddRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
 	return nil, types.ErrUnsupported
 }
 
 // UpdateRecord is not supported, will produce an error.
-func (authenticator) UpdateRecord(rec *auth.Rec, secret []byte, remoteAddr string) (*auth.Rec, error) {
+func (authenticator) UpdateRecord(ctx auth.AuthContext, rec *auth.Rec, secret []byte) (*auth.Rec, error) {
 	return nil, types.ErrUnsupported
 }
 
 // Authenticate checks validity of provided token.
-func (ta *authenticator) Authenticate(token []byte, remoteAddr string) (*auth.Rec, []byte, error) {
+func (ta *authenticator) Authenticate(ctx auth.AuthContext, token []byte) (*auth.Rec, []byte, error) {
 	var tl tokenLayout
 	dataSize := binary.Size(&tl)
-	if len(token) < dataSize+sha256.Size {
-		// Token is too short
+	if len(token) != dataSize+sha256.Size {
 		return nil, nil, types.ErrMalformed
 	}
 
@@ -104,6 +109,12 @@ func (ta *authenticator) Authenticate(token []byte, remoteAddr string) (*auth.Re
 	err := binary.Read(buf, binary.LittleEndian, &tl)
 	if err != nil {
 		return nil, nil, types.ErrMalformed
+	}
+	if tl.Version != tokenVersion || tl.TenantID == 0 {
+		return nil, nil, types.ErrFailed
+	}
+	if ctx.IsValid() && types.TenantID(tl.TenantID) != ctx.TenantID {
+		return nil, nil, types.ErrFailed
 	}
 
 	hbuf := new(bytes.Buffer)
@@ -133,6 +144,7 @@ func (ta *authenticator) Authenticate(token []byte, remoteAddr string) (*auth.Re
 	}
 
 	return &auth.Rec{
+		TenantID:  types.TenantID(tl.TenantID),
 		Uid:       types.Uid(tl.Uid),
 		AuthLevel: auth.Level(tl.AuthLevel),
 		Lifetime:  auth.Duration(time.Until(expires)),
@@ -142,6 +154,9 @@ func (ta *authenticator) Authenticate(token []byte, remoteAddr string) (*auth.Re
 
 // GenSecret generates a new token.
 func (ta *authenticator) GenSecret(rec *auth.Rec) ([]byte, time.Time, error) {
+	if rec == nil || rec.TenantID.IsZero() || rec.Uid.IsZero() {
+		return nil, time.Time{}, types.ErrMalformed
+	}
 
 	if rec.Lifetime == 0 {
 		rec.Lifetime = auth.Duration(ta.lifetime)
@@ -151,6 +166,8 @@ func (ta *authenticator) GenSecret(rec *auth.Rec) ([]byte, time.Time, error) {
 	expires := time.Now().Add(time.Duration(rec.Lifetime)).UTC().Round(time.Millisecond)
 
 	tl := tokenLayout{
+		Version:      tokenVersion,
+		TenantID:     uint64(rec.TenantID),
 		Uid:          uint64(rec.Uid),
 		Expires:      uint32(expires.Unix()),
 		AuthLevel:    uint16(rec.AuthLevel),
@@ -172,12 +189,12 @@ func (authenticator) AsTag(token string) string {
 }
 
 // IsUnique is not supported, will produce an error.
-func (authenticator) IsUnique(token []byte, remoteAddr string) (bool, error) {
+func (authenticator) IsUnique(ctx auth.AuthContext, token []byte) (bool, error) {
 	return false, types.ErrUnsupported
 }
 
 // DelRecords adds disabled user ID to a stop list.
-func (authenticator) DelRecords(uid types.Uid) error {
+func (authenticator) DelRecords(tenantID types.TenantID, uid types.Uid) error {
 	return nil
 }
 
@@ -188,7 +205,7 @@ func (authenticator) RestrictedTags() ([]string, error) {
 
 // GetResetParams returns authenticator parameters passed to password reset handler
 // (none for token).
-func (authenticator) GetResetParams(uid types.Uid) (map[string]any, error) {
+func (authenticator) GetResetParams(tenantID types.TenantID, uid types.Uid) (map[string]any, error) {
 	return nil, nil
 }
 

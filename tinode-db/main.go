@@ -199,8 +199,10 @@ func main() {
 	makeRoot := flag.String("make_root", "", "promote ordinary user to ROOT, auth scheme 'basic'")
 	datafile := flag.String("data", "", "name of file with sample data to load")
 	conffile := flag.String("config", "./tinode.conf", "config of the database connection")
+	tenantIDFlag := flag.Int64("tenant_id", 0, "tenant ID for users created or modified by this command")
 
 	flag.Parse()
+	tenantID := types.TenantID(*tenantIDFlag)
 
 	var data Data
 	if *datafile != "" && *datafile != "-" {
@@ -301,19 +303,36 @@ func main() {
 	}
 
 	if *reset || created {
-		genDb(&data, config.P2PDeleteEnabled)
+		if tenantID.IsZero() && len(data.Users) > 0 {
+			log.Fatalln("Must specify --tenant_id when loading sample users")
+		}
+		genDb(&data, config.P2PDeleteEnabled, tenantID)
 	} else if len(data.Users) > 0 {
 		log.Println("Sample data ignored.")
 	}
 
 	// Promote existing user account to root
 	if *makeRoot != "" {
+		if tenantID.IsZero() {
+			log.Fatalln("Must specify --tenant_id when promoting a tenant user")
+		}
 		adapter := store.Store.GetAdapter()
 		userId := types.ParseUserId(*makeRoot)
 		if userId.IsZero() {
 			log.Fatalf("Must specify a valid user ID '%s' to promote to ROOT", *makeRoot)
 		}
-		if err := adapter.AuthUpdRecord(userId, "basic", "", auth.LevelRoot, nil, time.Time{}); err != nil {
+		login, _, _, _, err := store.Users.GetAuthRecord(tenantID, userId, "basic")
+		if err != nil {
+			log.Fatalln("Failed to read user authentication record", err)
+		}
+		tenantAdapter, ok := adapter.(interface {
+			TenantAuthUpdRecord(types.TenantID, types.Uid, string, string, auth.Level, []byte, time.Time) error
+		})
+		if !ok {
+			log.Fatalln("Configured adapter does not support tenant authentication")
+		}
+		if err = tenantAdapter.TenantAuthUpdRecord(tenantID, userId, "basic", "basic:"+login,
+			auth.LevelRoot, nil, time.Time{}); err != nil {
 			log.Fatalln("Failed to promote user to ROOT", err)
 		}
 		log.Printf("User '%s' promoted to ROOT", *makeRoot)
@@ -321,6 +340,9 @@ func main() {
 
 	// Create root user account.
 	if *addRoot != "" {
+		if tenantID.IsZero() {
+			log.Fatalln("Must specify --tenant_id when creating a tenant user")
+		}
 		var password string
 		parts := strings.Split(*addRoot, ":")
 		uname := parts[0]
@@ -335,19 +357,20 @@ func main() {
 		}
 
 		var user types.User
+		user.TenantID = tenantID
 		user.Public = &card{
 			Fn: "ROOT " + uname,
 		}
-		store.Users.Create(&user, nil)
-
-		if _, err := store.Users.Create(&user, nil); err != nil {
+		if _, err := store.Users.Create(tenantID, &user, nil); err != nil {
 			log.Fatalln("Failed to create ROOT user:", err)
 		}
 
 		authHandler := store.Store.GetAuthHandler("basic")
-		if _, err := authHandler.AddRecord(&auth.Rec{Uid: user.Uid(), AuthLevel: auth.LevelRoot},
-			[]byte(uname+":"+password), ""); err != nil {
-			store.Users.Delete(user.Uid(), true)
+		ctx := auth.AuthContext{TenantID: tenantID}
+		if _, err := authHandler.AddRecord(ctx,
+			&auth.Rec{TenantID: tenantID, Uid: user.Uid(), AuthLevel: auth.LevelRoot},
+			[]byte(uname+":"+password)); err != nil {
+			store.Users.Delete(tenantID, user.Uid(), true)
 			log.Fatalln("Failed to add ROOT auth record:", err)
 		}
 		log.Printf("ROOT user created: '%s:%s'", uname, password)

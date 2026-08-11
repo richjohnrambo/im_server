@@ -251,6 +251,7 @@ func pbCliSerialize(msg *ClientComMessage) *pbx.ClientMsg {
 				Platform:   msg.Hi.Platform,
 				Lang:       msg.Hi.Lang,
 				Background: msg.Hi.Background,
+				Tenant:     msg.Hi.Tenant,
 			},
 		}
 	case msg.Acc != nil:
@@ -399,6 +400,7 @@ func pbCliDeserialize(pkt *pbx.ClientMsg) *ClientComMessage {
 			Platform:   hi.GetPlatform(),
 			Lang:       hi.GetLang(),
 			Background: hi.GetBackground(),
+			Tenant:     hi.GetTenant(),
 		}
 	} else if acc := pkt.GetAcc(); acc != nil {
 		msg.Acc = &MsgClientAcc{

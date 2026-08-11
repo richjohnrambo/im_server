@@ -17,9 +17,10 @@ import (
 // Subscribe or unsubscribe user to/from FCM topic (channel).
 func (t *Topic) channelSubUnsub(uid types.Uid, sub bool) {
 	push.ChannelSub(&push.ChannelReq{
-		Uid:     uid,
-		Channel: types.GrpToChn(t.name),
-		Unsub:   !sub,
+		TenantID: t.tenantID,
+		Uid:      uid,
+		Channel:  types.GrpToChn(t.name),
+		Unsub:    !sub,
 	})
 }
 
@@ -31,7 +32,8 @@ func (t *Topic) pushForData(fromUid types.Uid, data *MsgServerData, msgMarkedAsR
 	// Initialize the push receipt.
 	contentType, _ := data.Head["mime"].(string)
 	receipt := push.Receipt{
-		To: make(map[types.Uid]push.Recipient, t.subsCount()),
+		TenantID: t.tenantID,
+		To:       make(map[types.Uid]push.Recipient, t.subsCount()),
 		Payload: push.Payload{
 			What:        push.ActMsg,
 			Silent:      false,
@@ -94,7 +96,8 @@ func (t *Topic) preparePushForSubReceipt(fromUid types.Uid, now time.Time) *push
 
 	// Initialize the push receipt.
 	receipt := &push.Receipt{
-		To: make(map[types.Uid]push.Recipient, t.subsCount()),
+		TenantID: t.tenantID,
+		To:       make(map[types.Uid]push.Recipient, t.subsCount()),
 		Payload: push.Payload{
 			What:      push.ActSub,
 			Silent:    false,
@@ -143,10 +146,11 @@ func (t *Topic) pushForGroupSub(fromUid types.Uid, now time.Time) *push.Receipt 
 }
 
 // Prepares payload to be delivered to a mobile device as a push notification in response to owner deleting a channel.
-func pushForChanDelete(topicName string, now time.Time) *push.Receipt {
+func pushForChanDelete(tenantID types.TenantID, topicName string, now time.Time) *push.Receipt {
 	topicName = types.GrpToChn(topicName)
 	// Initialize the push receipt.
 	return &push.Receipt{
+		TenantID: tenantID,
 		Payload: push.Payload{
 			What:      push.ActSub,
 			Silent:    true,
@@ -170,7 +174,8 @@ func (t *Topic) pushForReadRcpt(uid types.Uid, seq int, now time.Time) *push.Rec
 
 	// Initialize the push receipt.
 	receipt := &push.Receipt{
-		To: make(map[types.Uid]push.Recipient, 1),
+		TenantID: t.tenantID,
+		To:       make(map[types.Uid]push.Recipient, 1),
 		Payload: push.Payload{
 			What:      push.ActRead,
 			Silent:    true,
@@ -195,19 +200,21 @@ func sendPush(rcpt *push.Receipt) {
 	// In case of a cluster pushes will be initiated at the nodes which own the users.
 	// Sort users into local and remote.
 	if globals.cluster != nil {
-		local = &UserCacheReq{PushRcpt: &push.Receipt{
-			Payload: rcpt.Payload,
-			Channel: rcpt.Channel,
-			To:      make(map[types.Uid]push.Recipient),
+		local = &UserCacheReq{TenantID: rcpt.TenantID, PushRcpt: &push.Receipt{
+			TenantID: rcpt.TenantID,
+			Payload:  rcpt.Payload,
+			Channel:  rcpt.Channel,
+			To:       make(map[types.Uid]push.Recipient),
 		}}
-		remote := &UserCacheReq{PushRcpt: &push.Receipt{
-			Payload: rcpt.Payload,
-			Channel: rcpt.Channel,
-			To:      make(map[types.Uid]push.Recipient),
+		remote := &UserCacheReq{TenantID: rcpt.TenantID, PushRcpt: &push.Receipt{
+			TenantID: rcpt.TenantID,
+			Payload:  rcpt.Payload,
+			Channel:  rcpt.Channel,
+			To:       make(map[types.Uid]push.Recipient),
 		}}
 
 		for uid, recipient := range rcpt.To {
-			if globals.cluster.isRemoteTopic(uid.UserId()) {
+			if globals.cluster.isRemoteTopic(types.TopicKey{TenantID: rcpt.TenantID, Topic: uid.UserId()}) {
 				remote.PushRcpt.To[uid] = recipient
 			} else {
 				local.PushRcpt.To[uid] = recipient
@@ -218,7 +225,7 @@ func sendPush(rcpt *push.Receipt) {
 			globals.cluster.routeUserReq(remote)
 		}
 	} else {
-		local = &UserCacheReq{PushRcpt: rcpt}
+		local = &UserCacheReq{TenantID: rcpt.TenantID, PushRcpt: rcpt}
 	}
 
 	if len(local.PushRcpt.To) > 0 || local.PushRcpt.Channel != "" {

@@ -84,7 +84,7 @@ ServerComMessage
 
 | 消息 | 结构体 | 说明 |
 |------|--------|------|
-| `{hi}` | `MsgClientHi` | 握手，上报 UA/版本/设备ID/语言 |
+| `{hi}` | `MsgClientHi` | 握手，上报必填企业码及 UA/版本/设备ID/语言 |
 | `{acc}` | `MsgClientAcc` | 创建/更新用户账号 |
 | `{login}` | `MsgClientLogin` | 登录认证 |
 | `{sub}` | `MsgClientSub` | 订阅 Topic（加入群/私聊） |

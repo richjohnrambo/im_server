@@ -252,7 +252,7 @@ func (v *validator) PreCheck(cred string, _ map[string]any) (string, error) {
 }
 
 // Send a request for confirmation to the user: makes a record in DB and nothing else.
-func (v *validator) Request(user t.Uid, email, lang, resp string, tmpToken []byte) (bool, error) {
+func (v *validator) Request(tenantID t.TenantID, user t.Uid, email, lang, resp string, tmpToken []byte) (bool, error) {
 	// Email validator cannot accept an immediate response.
 	if resp != "" {
 		return false, t.ErrFailed
@@ -294,7 +294,7 @@ func (v *validator) Request(user t.Uid, email, lang, resp string, tmpToken []byt
 	}
 
 	// Create or update validation record in DB.
-	isNew, err := store.Users.UpsertCred(&t.Credential{
+	isNew, err := store.Users.UpsertCred(tenantID, &t.Credential{
 		User:   user.String(),
 		Method: validatorName,
 		Value:  email,
@@ -310,7 +310,7 @@ func (v *validator) Request(user t.Uid, email, lang, resp string, tmpToken []byt
 }
 
 // ResetSecret sends a message with instructions for resetting an authentication secret.
-func (v *validator) ResetSecret(email, scheme, lang string, code []byte, params map[string]any) error {
+func (v *validator) ResetSecret(tenantID t.TenantID, email, scheme, lang string, code []byte, params map[string]any) error {
 	// Normalize email to make sure Unicode case collisions don't lead to security problems.
 	email = strings.ToLower(email)
 
@@ -346,8 +346,8 @@ func (v *validator) ResetSecret(email, scheme, lang string, code []byte, params 
 
 // Check checks if the provided validation response matches the expected response.
 // Returns the value of validated credential on success.
-func (v *validator) Check(user t.Uid, resp string) (string, error) {
-	cred, err := store.Users.GetActiveCred(user, validatorName)
+func (v *validator) Check(tenantID t.TenantID, user t.Uid, resp string) (string, error) {
+	cred, err := store.Users.GetActiveCred(tenantID, user, validatorName)
 	if err != nil {
 		return "", err
 	}
@@ -368,23 +368,23 @@ func (v *validator) Check(user t.Uid, resp string) (string, error) {
 	// Comparing with dummy response too.
 	if cred.Resp == resp || v.DebugResponse == resp {
 		// Valid response, save confirmation.
-		return cred.Value, store.Users.ConfirmCred(user, validatorName)
+		return cred.Value, store.Users.ConfirmCred(tenantID, user, validatorName)
 	}
 
 	// Invalid response, increment fail counter, ignore possible error.
-	store.Users.FailCred(user, validatorName)
+	store.Users.FailCred(tenantID, user, validatorName)
 
 	return "", t.ErrCredentials
 }
 
 // Delete deletes user's records.
-func (v *validator) Delete(user t.Uid) error {
-	return store.Users.DelCred(user, validatorName, "")
+func (v *validator) Delete(tenantID t.TenantID, user t.Uid) error {
+	return store.Users.DelCred(tenantID, user, validatorName, "")
 }
 
 // Remove deactivates or removes user's credential.
-func (v *validator) Remove(user t.Uid, value string) error {
-	return store.Users.DelCred(user, validatorName, value)
+func (v *validator) Remove(tenantID t.TenantID, user t.Uid, value string) error {
+	return store.Users.DelCred(tenantID, user, validatorName, value)
 }
 
 // TempAuthScheme returns a temporary authentication method used by this validator.

@@ -504,6 +504,9 @@ func (os ObjState) Value() (driver.Value, error) {
 type User struct {
 	ObjHeader `bson:",inline"`
 
+	// TenantID identifies the tenant which owns this user.
+	TenantID TenantID `db:"tenant_id" json:"-" bson:"tenant_id"`
+
 	State   ObjState
 	StateAt *time.Time `json:"StateAt,omitempty" bson:",omitempty"`
 
@@ -892,6 +895,8 @@ type LastSeenUA struct {
 // Subscription to a topic
 type Subscription struct {
 	ObjHeader `bson:",inline"`
+	// TenantID identifies the tenant which owns this subscription.
+	TenantID TenantID `db:"tenant_id" json:"-" bson:"tenant_id"`
 	// User who has relationship with the topic
 	User string
 	// Topic subscribed to
@@ -1106,6 +1111,7 @@ func (kvm KVMap) Value() (driver.Value, error) {
 // Topic stored in database. Topic's name is Id
 type Topic struct {
 	ObjHeader `bson:",inline"`
+	TenantID  TenantID `db:"tenant_id" json:"-" bson:"tenant_id"`
 
 	// State of the topic: normal (ok), suspended, deleted
 	State   ObjState
@@ -1212,6 +1218,7 @@ type SoftDelete struct {
 // Message is a stored {data} message
 type Message struct {
 	ObjHeader `bson:",inline"`
+	TenantID  TenantID   `db:"tenant_id" json:"-" bson:"tenant_id"`
 	DeletedAt *time.Time `json:"DeletedAt,omitempty" bson:",omitempty"`
 
 	// ID of the hard-delete operation
@@ -1318,6 +1325,7 @@ func SliceToRanges(in []int) []Range {
 // DelMessage is a log entry of a deleted message range.
 type DelMessage struct {
 	ObjHeader   `bson:",inline"`
+	TenantID    TenantID `db:"tenant_id" json:"-" bson:"tenant_id"`
 	Topic       string
 	DeletedFor  string
 	DelId       int
@@ -1400,6 +1408,7 @@ func IsEphemeralTopic(topic string) bool {
 // DeviceDef is the data provided by connected device. Used primarily for
 // push notifications.
 type DeviceDef struct {
+	TenantID TenantID `db:"tenant_id" json:"-" bson:"tenant_id"`
 	// Device registration ID
 	DeviceId string
 	// Device platform (iOS, Android, Web)
@@ -1425,6 +1434,7 @@ const (
 // FileDef is a stored record of a file upload
 type FileDef struct {
 	ObjHeader `bson:",inline"`
+	TenantID  TenantID `db:"tenant_id" json:"-" bson:"tenant_id"`
 	// Status of upload
 	Status int
 	// User who created the file

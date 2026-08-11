@@ -391,6 +391,7 @@ type debugSession struct {
 
 // debugTopic is a topic debug info.
 type debugTopic struct {
+	TenantID int64    `json:"tenant_id"`
 	Topic    string   `json:"topic,omitempty"`
 	Xorig    string   `json:"xorig,omitempty"`
 	IsProxy  bool     `json:"is_proxy,omitempty"`
@@ -401,9 +402,10 @@ type debugTopic struct {
 
 // debugCachedUser is a user cache entry debug info.
 type debugCachedUser struct {
-	Uid    string `json:"uid,omitempty"`
-	Unread int    `json:"unread,omitempty"`
-	Topics int    `json:"topics,omitempty"`
+	TenantID int64  `json:"tenant_id"`
+	Uid      string `json:"uid,omitempty"`
+	Unread   int    `json:"unread,omitempty"`
+	Topics   int    `json:"topics,omitempty"`
 }
 
 // debugDump is server internal state dump for debugging.
@@ -464,6 +466,7 @@ func serveStatus(wrt http.ResponseWriter, req *http.Request) {
 			ps = append(ps, key)
 		}
 		result.Topics = append(result.Topics, debugTopic{
+			TenantID: int64(topic.tenantID),
 			Topic:    topic.name,
 			Xorig:    topic.xoriginal,
 			IsProxy:  topic.isProxy,
@@ -475,9 +478,10 @@ func serveStatus(wrt http.ResponseWriter, req *http.Request) {
 	})
 	for k, v := range usersCache {
 		result.UserCache = append(result.UserCache, debugCachedUser{
-			Uid:    k.UserId(),
-			Unread: v.unread,
-			Topics: v.topics,
+			TenantID: int64(k.TenantID),
+			Uid:      k.User.UserId(),
+			Unread:   v.unread,
+			Topics:   v.topics,
 		})
 	}
 

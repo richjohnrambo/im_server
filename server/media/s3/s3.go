@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -185,7 +186,7 @@ func (ah *awshandler) Init(jsconf string) error {
 }
 
 // Headers adds CORS headers and redirects GET and HEAD requests to the AWS server.
-func (ah *awshandler) Headers(method string, url *url.URL, headers http.Header, serve bool) (http.Header, int, error) {
+func (ah *awshandler) Headers(tenantID types.TenantID, method string, url *url.URL, headers http.Header, serve bool) (http.Header, int, error) {
 	// Add CORS headers, if necessary.
 	headers, status := media.CORSHandler(method, headers, ah.corsOrigins, serve)
 	if status != 0 || method == http.MethodPost || method == http.MethodPut {
@@ -197,7 +198,7 @@ func (ah *awshandler) Headers(method string, url *url.URL, headers http.Header, 
 		return nil, 0, types.ErrNotFound
 	}
 
-	fdef, err := ah.getFileRecord(fid)
+	fdef, err := ah.getFileRecord(tenantID, fid)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -266,12 +267,14 @@ func (ah *awshandler) Headers(method string, url *url.URL, headers http.Header, 
 func (ah *awshandler) Upload(fdef *types.FileDef, file io.Reader) (string, int64, error) {
 	var err error
 
-	// Using String32 just for consistency with the file handler.
-	key := fdef.Uid().String32()
+	key, err := tenantObjectKey(fdef.TenantID, fdef.Uid().String32(), fdef.CreatedAt)
+	if err != nil {
+		return "", 0, err
+	}
 
 	tmClient := transfermanager.New(ah.svc)
 
-	if err = store.Files.StartUpload(fdef); err != nil {
+	if err = store.Files.StartUpload(fdef.TenantID, fdef); err != nil {
 		logs.Warn.Println("failed to create file record", fdef.Id, err)
 		return "", 0, err
 	}
@@ -303,7 +306,7 @@ func (ah *awshandler) Upload(fdef *types.FileDef, file io.Reader) (string, int64
 
 // Download processes request for file download.
 // The returned ReadSeekCloser must be closed after use.
-func (ah *awshandler) Download(url string) (*types.FileDef, media.ReadSeekCloser, error) {
+func (ah *awshandler) Download(tenantID types.TenantID, url string) (*types.FileDef, media.ReadSeekCloser, error) {
 	return nil, nil, types.ErrUnsupported
 }
 
@@ -354,8 +357,8 @@ func (ah *awshandler) GetIdFromUrl(url string) types.Uid {
 }
 
 // getFileRecord given file ID reads file record from the database.
-func (ah *awshandler) getFileRecord(fid types.Uid) (*types.FileDef, error) {
-	fd, err := store.Files.Get(fid.String())
+func (ah *awshandler) getFileRecord(tenantID types.TenantID, fid types.Uid) (*types.FileDef, error) {
+	fd, err := store.Files.Get(tenantID, fid.String())
 	if err != nil {
 		return nil, err
 	}
@@ -363,6 +366,17 @@ func (ah *awshandler) getFileRecord(fid types.Uid) (*types.FileDef, error) {
 		return nil, types.ErrNotFound
 	}
 	return fd, nil
+}
+
+func tenantObjectKey(tenantID types.TenantID, fileID string, createdAt time.Time) (string, error) {
+	if !tenantID.IsValid() || fileID == "" {
+		return "", types.ErrMalformed
+	}
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	return path.Join("tenants", strconv.FormatInt(int64(tenantID), 10),
+		createdAt.Format("2006"), createdAt.Format("01"), fileID), nil
 }
 
 func init() {
